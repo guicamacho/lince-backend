@@ -1,0 +1,29 @@
+{
+  "name": "lince-phase1",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lince Finance — Phase 1 spine (Avenia rail, Modelo A). Modular monolith.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migrate": "tsx db/migrate.ts",
+    "dev": "tsx watch src/app.ts",
+    "pretest": "DATABASE_URL=postgres://localhost:5432/lince_test tsx db/migrate.ts",
+    "test": "DATABASE_URL=postgres://localhost:5432/lince_test node --import tsx --test --test-concurrency=1 'test/**/*.test.ts'"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^20.14.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
