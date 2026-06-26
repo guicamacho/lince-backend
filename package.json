@@ -16,6 +16,7 @@
     "test": "DATABASE_URL=postgres://localhost:5432/lince_test node --import tsx --test --test-concurrency=1 'test/**/*.test.ts'"
   },
   "dependencies": {
+    "@clerk/express": "^2.1.32",
     "express": "^5.2.1",
     "pg": "^8.13.0"
   },

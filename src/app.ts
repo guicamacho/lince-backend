@@ -4,21 +4,25 @@
  *   Public:     GET  /healthz                 — liveness + DB ping
  *   Pre-active: POST /onboarding/prescreen     — completeness-only (Modelo A) -> pending org
  *   Intake:     POST /webhooks/:provider       — persist raw event ONLY (processing is gated/stubbed)
- *   Gated app:  everything under /app           — the ONE gate: requires org.state = 'active'
+ *   Gated app:  everything under /app           — requires a Clerk session + an active org
  *
- * Auth is plumbing-only in P1: the caller's active org comes from an `x-org-id` header
- * (dev seam). Real Clerk session -> person/org resolution is a later milestone (PRD-02).
- * No regulated PII crosses the app; money flows (Avenia) + Didit are stubbed.
+ * Auth = Clerk (@clerk/express). /app/* uses requireAuth() then maps the Clerk user
+ * (getAuth.userId) -> people.clerk_user_id -> active org. Linking a Clerk user to a person
+ * (signup/onboarding) is a later milestone. Modelo A: Clerk carries auth identity ONLY —
+ * no regulated PII. Money flows (Avenia) + Didit are stubbed.
  */
 import { randomUUID } from "node:crypto";
 import express, { type Request, type Response, type NextFunction } from "express";
 import { env } from "./config/env.js";
+import { clerkMiddleware, getAuth } from "@clerk/express";
 import { pool } from "./db/pool.js";
-import { isOrgActive } from "./modules/access/requireActiveOrg.js";
+import { activeOrgForClerkUser } from "./modules/access/orgContext.js";
 import { prescreenAndCreateOrg } from "./modules/onboarding/prescreen.js";
 
 export const app = express();
 app.use(express.json());
+// Attach Clerk auth context to every request (does not enforce; routes opt in with requireAuth).
+app.use(clerkMiddleware());
 
 app.get("/healthz", async (_req: Request, res: Response) => {
   await pool.query("select 1");
@@ -43,18 +47,26 @@ app.post("/webhooks/:provider", async (req: Request, res: Response) => {
   res.status(202).json({ received: true });
 });
 
-// The ONE access gate: no app surface unless the org is active.
+// The ONE access gate: a valid Clerk session AND an active org.
+// clerkMiddleware populates auth; we return an API-style 401 (not requireAuth()'s redirect)
+// when unauthenticated, and 403 when authenticated but mapped to no active org.
 app.use("/app", async (req: Request, res: Response, next: NextFunction) => {
-  const orgId = req.header("x-org-id");
-  if (!orgId || !(await isOrgActive(orgId))) {
-    res.status(403).json({ error: "org_not_active" });
+  const { userId } = getAuth(req);
+  if (!userId) {
+    res.status(401).json({ error: "unauthenticated" });
     return;
   }
+  const orgId = await activeOrgForClerkUser(userId);
+  if (!orgId) {
+    res.status(403).json({ error: "no_active_org" });
+    return;
+  }
+  res.locals.orgId = orgId;
   next();
 });
 
-app.get("/app/me", async (req: Request, res: Response) => {
-  const { rows } = await pool.query("select id, razao_social, state from orgs where id = $1", [req.header("x-org-id")]);
+app.get("/app/me", async (_req: Request, res: Response) => {
+  const { rows } = await pool.query("select id, razao_social, state from orgs where id = $1", [res.locals.orgId]);
   res.json(rows[0] ?? null);
 });
 
