@@ -20,6 +20,7 @@ export const env = {
   clerk: {
     secretKey: optional("CLERK_SECRET_KEY"),
     publishableKey: optional("CLERK_PUBLISHABLE_KEY"),
+    webhookSigningSecret: optional("CLERK_WEBHOOK_SIGNING_SECRET"),
   },
   avenia: {
     baseUrl: optional("AVENIA_BASE_URL") ?? "https://api.sandbox.avenia.io:10952",

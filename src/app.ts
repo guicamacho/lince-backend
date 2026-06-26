@@ -18,9 +18,12 @@ import { clerkMiddleware, getAuth } from "@clerk/express";
 import { pool } from "./db/pool.js";
 import { activeOrgForClerkUser } from "./modules/access/orgContext.js";
 import { prescreenAndCreateOrg } from "./modules/onboarding/prescreen.js";
+import { linkClerkUserFromEvent } from "./modules/identity/clerkSync.js";
+import { Webhook } from "svix";
 
 export const app = express();
-app.use(express.json());
+// Capture the raw body (needed to verify webhook signatures) while still parsing JSON.
+app.use(express.json({ verify: (req, _res, buf) => { (req as unknown as { rawBody?: Buffer }).rawBody = buf; } }));
 // Attach Clerk auth context to every request (does not enforce; routes opt in with requireAuth).
 app.use(clerkMiddleware());
 
@@ -35,7 +38,38 @@ app.post("/onboarding/prescreen", async (req: Request, res: Response) => {
   res.status(201).json(result);
 });
 
-// Webhook intake — store the raw event; do NOT process (gated on vendor payload mapping).
+// Clerk webhook — SIGNATURE-VERIFIED (Svix). Registered before the generic /webhooks/:provider.
+// This is the control that keeps the endpoint from being "open to everyone": no valid
+// Svix signature -> rejected. (IP allowlisting, if ever wanted, belongs at the edge/Fly.)
+app.post("/webhooks/clerk", async (req: Request, res: Response) => {
+  const secret = env.clerk.webhookSigningSecret;
+  if (!secret) {
+    res.status(503).json({ error: "webhook_not_configured" });
+    return;
+  }
+  const raw = (req as unknown as { rawBody?: Buffer }).rawBody?.toString("utf8") ?? "";
+  let event: { type: string; data: unknown };
+  try {
+    event = new Webhook(secret).verify(raw, {
+      "svix-id": req.header("svix-id") ?? "",
+      "svix-timestamp": req.header("svix-timestamp") ?? "",
+      "svix-signature": req.header("svix-signature") ?? "",
+    }) as { type: string; data: unknown };
+  } catch {
+    res.status(400).json({ error: "invalid_signature" });
+    return;
+  }
+  await pool.query(
+    `insert into webhook_events (provider_code, external_event_id, event_type, payload)
+     values ('clerk', $1, $2, $3)
+     on conflict (provider_code, external_event_id) do nothing`,
+    [req.header("svix-id") ?? randomUUID(), event.type, JSON.stringify(event)],
+  );
+  await linkClerkUserFromEvent(event as Parameters<typeof linkClerkUserFromEvent>[0]);
+  res.status(202).json({ received: true });
+});
+
+// Generic webhook intake — store the raw event; do NOT process (gated on vendor payload mapping).
 app.post("/webhooks/:provider", async (req: Request, res: Response) => {
   const externalId = String(req.header("x-event-id") ?? req.body?.id ?? randomUUID());
   await pool.query(
