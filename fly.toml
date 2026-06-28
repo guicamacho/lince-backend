@@ -1,4 +1,4 @@
-app = "lince-phase1"
+app = "lince-dev"
 primary_region = "gru"
 
 [env]
