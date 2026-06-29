@@ -31,4 +31,7 @@ export const env = {
     apiKey: optional("DIDIT_API_KEY"),
     webhookSecret: optional("DIDIT_WEBHOOK_SECRET"),
   },
+  // Shared secret for server-to-server /admin/* calls from the admin app (which
+  // authenticates staff via its own, separate Clerk instance).
+  adminServiceToken: optional("ADMIN_SERVICE_TOKEN"),
 } as const;

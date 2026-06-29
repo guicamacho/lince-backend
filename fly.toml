@@ -1,22 +1,15 @@
-app = "lince-phase1"
+app = "lince-api-dev"
 primary_region = "gru"
 
 [env]
   NODE_ENV = "production"
   PORT = "3000"
 
-[http_service]
-  internal_port = 3000
-  force_https = true
-  auto_stop_machines = "stop"
-  auto_start_machines = true
-  min_machines_running = 0
-
-[[http_service.checks]]
-  path = "/healthz"
-  interval = "15s"
-  timeout = "2s"
-  grace_period = "5s"
+# Private-only: this app has NO public service, so Fly allocates no public IPs and
+# *.fly.dev is dark. It is reached solely via the Cloudflare Tunnel over Fly's 6PN
+# private network at http://lince-api-dev.internal:3000 (see the lince-cf-tunnel app).
+# With no service there is no auto-stop, so the single machine runs continuously
+# (Fly restarts it on crash); cloudflared reconnects to it automatically.
 
 # Runs migrations before each release goes live (uses the DATABASE_URL secret).
 [deploy]

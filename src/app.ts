@@ -1,15 +1,20 @@
 /**
  * Lince Phase 1 — HTTP entry (Express). Modular monolith.
  *
- *   Public:     GET  /healthz                 — liveness + DB ping
- *   Pre-active: POST /onboarding/prescreen     — completeness-only (Modelo A) -> pending org
- *   Intake:     POST /webhooks/:provider       — persist raw event ONLY (processing is gated/stubbed)
- *   Gated app:  everything under /app           — requires a Clerk session + an active org
+ *   Public:     GET  /healthz                       — liveness + DB ping
+ *   Onboarding: POST /onboarding/bootstrap            — (authed) signup -> person + org(pending) + owner
+ *               GET  /onboarding/state               — (authed) caller's org state (drives the shell gate)
+ *               POST /onboarding/launch-verification  — (authed) pending -> kyb_in_progress (Didit launch, mocked)
+ *               POST /onboarding/mock-verify          — (authed) kyb_in_progress -> vendor_pending (mock Didit complete)
+ *   Intake:     POST /webhooks/:provider             — persist raw event ONLY (processing is gated/stubbed)
+ *   Gated app:  everything under /app                 — requires a Clerk session + an active org
+ *   Admin:      /admin/*                              — service-token gated; the admin app authenticates staff
+ *                                                       via its own Clerk instance, then calls server-to-server.
+ *                                                       approve = recordAveniaVerdict relay (Modelo A).
  *
- * Auth = Clerk (@clerk/express). /app/* uses requireAuth() then maps the Clerk user
- * (getAuth.userId) -> people.clerk_user_id -> active org. Linking a Clerk user to a person
- * (signup/onboarding) is a later milestone. Modelo A: Clerk carries auth identity ONLY —
- * no regulated PII. Money flows (Avenia) + Didit are stubbed.
+ * Auth = Clerk (@clerk/express). Customer routes map the Clerk user (getAuth.userId)
+ * -> people.clerk_user_id -> org. Modelo A: Clerk carries auth identity ONLY — no
+ * regulated PII. Money flows (Avenia) + real Didit are stubbed.
  */
 import { randomUUID } from "node:crypto";
 import express, { type Request, type Response, type NextFunction } from "express";
@@ -20,12 +25,31 @@ import { activeOrgForClerkUser } from "./modules/access/orgContext.js";
 import { prescreenAndCreateOrg } from "./modules/onboarding/prescreen.js";
 import { linkClerkUserFromEvent } from "./modules/identity/clerkSync.js";
 import { Webhook } from "svix";
+import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
+import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
+import { recordAveniaVerdict } from "./modules/onboarding/admission.service.js";
+import { ensureAdminUser } from "./modules/identity/adminSync.js";
+import { requireAdminServiceToken } from "./modules/access/adminAuth.js";
+import { MockKybProvider } from "./modules/providers/didit/mock.kyb.js";
 
 export const app = express();
 // Capture the raw body (needed to verify webhook signatures) while still parsing JSON.
 app.use(express.json({ verify: (req, _res, buf) => { (req as unknown as { rawBody?: Buffer }).rawBody = buf; } }));
-// Attach Clerk auth context to every request (does not enforce; routes opt in with requireAuth).
+// Attach Clerk auth context to every request (does not enforce; routes opt in).
 app.use(clerkMiddleware());
+
+const mockKyb = new MockKybProvider();
+
+// Resolve the caller's Clerk user id, or write a 401 and return null. Pre-active
+// onboarding routes need a session but NOT an active org (that's the /app gate).
+function requireClerkUserId(req: Request, res: Response): string | null {
+  const { userId } = getAuth(req);
+  if (!userId) {
+    res.status(401).json({ error: "unauthenticated" });
+    return null;
+  }
+  return userId;
+}
 
 app.get("/healthz", async (_req: Request, res: Response) => {
   await pool.query("select 1");
@@ -36,6 +60,36 @@ app.get("/healthz", async (_req: Request, res: Response) => {
 app.post("/onboarding/prescreen", async (req: Request, res: Response) => {
   const result = await prescreenAndCreateOrg(req.body ?? {});
   res.status(201).json(result);
+});
+
+// Bootstrap on signup (authed): person + org(pending) + owner. Captures CNPJ/name/role; NO CPF.
+app.post("/onboarding/bootstrap", async (req: Request, res: Response) => {
+  const uid = requireClerkUserId(req, res);
+  if (!uid) return;
+  res.status(201).json(await bootstrapOrgForClerkUser(uid, req.body ?? {}));
+});
+
+// Read the caller's org state (drives the customer shell gate). null if no org yet.
+app.get("/onboarding/state", async (req: Request, res: Response) => {
+  const uid = requireClerkUserId(req, res);
+  if (!uid) return;
+  res.json(await currentOrgForClerkUser(uid));
+});
+
+// "Start verification": launch Didit (mocked) -> kyb_in_progress.
+app.post("/onboarding/launch-verification", async (req: Request, res: Response) => {
+  const uid = requireClerkUserId(req, res);
+  if (!uid) return;
+  const snap = await advanceCallerOrg(uid, "kyb_in_progress");
+  const session = await mockKyb.launchVerification({ orgId: snap.orgId });
+  res.json({ ...snap, hostedUrl: session.hostedUrl });
+});
+
+// Mock Didit complete + forward to Avenia -> vendor_pending (under review).
+app.post("/onboarding/mock-verify", async (req: Request, res: Response) => {
+  const uid = requireClerkUserId(req, res);
+  if (!uid) return;
+  res.json(await advanceCallerOrg(uid, "vendor_pending"));
 });
 
 // Clerk webhook — SIGNATURE-VERIFIED (Svix). Registered before the generic /webhooks/:provider.
@@ -101,6 +155,36 @@ app.use("/app", async (req: Request, res: Response, next: NextFunction) => {
 
 app.get("/app/me", async (_req: Request, res: Response) => {
   const { rows } = await pool.query("select id, razao_social, state from orgs where id = $1", [res.locals.orgId]);
+  res.json(rows[0] ?? null);
+});
+
+// --- Admin (internal) — service-token gated; the admin app authenticates staff via
+//     its own (separate) Clerk instance, then calls these server-to-server. ---
+app.get("/admin/orgs", requireAdminServiceToken, async (_req: Request, res: Response) => {
+  const { rows } = await pool.query(
+    `select id, cnpj, razao_social, state, admission_state, kyb_forwarded_at, created_at
+       from orgs where deleted_at is null order by created_at desc limit 200`,
+  );
+  res.json({ orgs: rows });
+});
+
+// Record Avenia's decision (the gate). Approve -> org active. Audit-logged AS A RELAY
+// inside recordAveniaVerdict. Modelo A: this records Avenia's verdict, not a Lince one.
+app.post("/admin/orgs/:id/approve", requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { adminClerkUserId, adminEmail, adminName, aveniaReference } = req.body ?? {};
+  if (!adminClerkUserId || !adminEmail) {
+    res.status(400).json({ error: "missing_admin_identity" });
+    return;
+  }
+  const orgId = String(req.params.id);
+  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  await recordAveniaVerdict({
+    orgId,
+    decision: "approved",
+    aveniaReference: String(aveniaReference ?? `stub-skeleton-${Date.now()}`),
+    recordedByAdminId: adminId,
+  });
+  const { rows } = await pool.query("select id, state, admission_state from orgs where id = $1", [orgId]);
   res.json(rows[0] ?? null);
 });
 
