@@ -168,21 +168,31 @@ app.get("/admin/orgs", requireAdminServiceToken, async (_req: Request, res: Resp
   res.json({ orgs: rows });
 });
 
-// Record Avenia's decision (the gate). Approve -> org active. Audit-logged AS A RELAY
-// inside recordAveniaVerdict. Modelo A: this records Avenia's verdict, not a Lince one.
-app.post("/admin/orgs/:id/approve", requireAdminServiceToken, async (req: Request, res: Response) => {
-  const { adminClerkUserId, adminEmail, adminName, aveniaReference } = req.body ?? {};
+// Record Avenia's decision (the relay gate). approved -> org active; rejected -> rejected +
+// CNPJ denylist (with the mandatory reason). Audit-logged AS A RELAY inside recordAveniaVerdict.
+// Modelo A: this records Avenia's verdict, not a Lince adjudication.
+app.post("/admin/orgs/:id/verdict", requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { adminClerkUserId, adminEmail, adminName, decision, aveniaReference, remark } = req.body ?? {};
   if (!adminClerkUserId || !adminEmail) {
     res.status(400).json({ error: "missing_admin_identity" });
+    return;
+  }
+  if (decision !== "approved" && decision !== "rejected") {
+    res.status(400).json({ error: "invalid_decision" });
+    return;
+  }
+  if (decision === "rejected" && !String(remark ?? "").trim()) {
+    res.status(400).json({ error: "remark_required_on_reject" });
     return;
   }
   const orgId = String(req.params.id);
   const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
   await recordAveniaVerdict({
     orgId,
-    decision: "approved",
-    aveniaReference: String(aveniaReference ?? `stub-skeleton-${Date.now()}`),
+    decision,
+    aveniaReference: String(aveniaReference || `stub-skeleton-${Date.now()}`),
     recordedByAdminId: adminId,
+    remark: remark ? String(remark) : undefined,
   });
   const { rows } = await pool.query("select id, state, admission_state from orgs where id = $1", [orgId]);
   res.json(rows[0] ?? null);
