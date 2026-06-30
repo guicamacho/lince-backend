@@ -10,11 +10,12 @@ export interface OrgAccessContext {
 }
 
 export async function isOrgActive(orgId: string): Promise<boolean> {
-  const { rows } = await pool.query<{ state: string }>(
-    "select state from orgs where id = $1 and deleted_at is null",
+  const { rows } = await pool.query<{ state: string; access_status: string }>(
+    "select state, access_status from orgs where id = $1 and deleted_at is null",
     [orgId],
   );
-  return rows[0]?.state === "active";
+  // Access requires BOTH the lifecycle state and the access_status (suspend/block, mig 0002).
+  return rows[0]?.state === "active" && rows[0]?.access_status === "active";
 }
 
 /**

@@ -162,7 +162,7 @@ app.get("/app/me", async (_req: Request, res: Response) => {
 //     its own (separate) Clerk instance, then calls these server-to-server. ---
 app.get("/admin/orgs", requireAdminServiceToken, async (_req: Request, res: Response) => {
   const { rows } = await pool.query(
-    `select id, cnpj, razao_social, state, admission_state, kyb_forwarded_at, created_at
+    `select id, cnpj, razao_social, state, admission_state, access_status, kyb_forwarded_at, created_at
        from orgs where deleted_at is null order by created_at desc limit 200`,
   );
   res.json({ orgs: rows });

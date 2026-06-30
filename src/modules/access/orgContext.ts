@@ -17,6 +17,7 @@ export async function activeOrgForClerkUser(clerkUserId: string): Promise<string
        join orgs o on o.id = op.org_id
       where p.clerk_user_id = $1
         and o.state = 'active'
+        and o.access_status = 'active'
         and o.deleted_at is null
       order by o.created_at asc
       limit 1`,
