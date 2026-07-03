@@ -11,6 +11,7 @@
  *   Admin:      /admin/*                              — service-token gated; the admin app authenticates staff
  *                                                       via its own Clerk instance, then calls server-to-server.
  *                                                       approve = recordAveniaVerdict relay (Modelo A).
+ *                                                       access = setOrgAccess (suspend/block/reinstate, audited).
  *
  * Auth = Clerk (@clerk/express). Customer routes map the Clerk user (getAuth.userId)
  * -> people.clerk_user_id -> org. Modelo A: Clerk carries auth identity ONLY — no
@@ -22,12 +23,13 @@ import { env } from "./config/env.js";
 import { clerkMiddleware, getAuth } from "@clerk/express";
 import { pool } from "./db/pool.js";
 import { activeOrgForClerkUser } from "./modules/access/orgContext.js";
-import { prescreenAndCreateOrg } from "./modules/onboarding/prescreen.js";
+import { setOrgAccess } from "./modules/access/access.service.js";
 import { linkClerkUserFromEvent } from "./modules/identity/clerkSync.js";
 import { Webhook } from "svix";
 import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
 import { recordAveniaVerdict } from "./modules/onboarding/admission.service.js";
+import { listBeneficiariesForOrg, createBeneficiaryForOrg } from "./modules/beneficiaries/beneficiaries.service.js";
 import { ensureAdminUser } from "./modules/identity/adminSync.js";
 import { requireAdminServiceToken } from "./modules/access/adminAuth.js";
 import { MockKybProvider } from "./modules/providers/didit/mock.kyb.js";
@@ -54,12 +56,6 @@ function requireClerkUserId(req: Request, res: Response): string | null {
 app.get("/healthz", async (_req: Request, res: Response) => {
   await pool.query("select 1");
   res.json({ ok: true });
-});
-
-// Onboarding pre-screen (pre-active surface). Completeness-only — Avenia decides admission.
-app.post("/onboarding/prescreen", async (req: Request, res: Response) => {
-  const result = await prescreenAndCreateOrg(req.body ?? {});
-  res.status(201).json(result);
 });
 
 // Bootstrap on signup (authed): person + org(pending) + owner. Captures CNPJ/name/role; NO CPF.
@@ -159,55 +155,15 @@ app.get("/app/me", async (_req: Request, res: Response) => {
 });
 
 // Beneficiaries — travel-rule capture (AUSTRAC §4 / 255033346). The customer captures payee
-// tracing info; Billr retains it and forwards to Avenia later (mocked in P1, so
+// tracing info; Lince retains it and forwards to Avenia later (mocked in P1, so
 // avenia_beneficiary_id stays null). The /app gate has set res.locals.orgId.
 app.get("/app/beneficiaries", async (_req: Request, res: Response) => {
-  const { rows } = await pool.query(
-    `select id, label, payee_legal_name, payee_country, payee_bank_psp, payee_account,
-            payee_memo, purpose_of_payment, source_of_funds, status, avenia_beneficiary_id, created_at
-       from avenia_beneficiaries where org_id = $1 order by created_at desc`,
-    [res.locals.orgId],
-  );
-  res.json({ beneficiaries: rows });
+  res.json({ beneficiaries: await listBeneficiariesForOrg(res.locals.orgId) });
 });
 
 app.post("/app/beneficiaries", async (req: Request, res: Response) => {
-  const b = (req.body ?? {}) as Record<string, unknown>;
-  const required = ["label", "payeeLegalName", "payeeCountry", "payeeBankPsp", "payeeAccount", "purposeOfPayment"] as const;
-  for (const k of required) {
-    if (!String(b[k] ?? "").trim()) {
-      res.status(400).json({ error: `missing_${k}` });
-      return;
-    }
-  }
-  // The authorising individual (org_people) — supports the SMR "who completed it" field.
   const { userId } = getAuth(req);
-  const { rows: ap } = await pool.query<{ id: string }>(
-    `select p.id from people p join org_people op on op.person_id = p.id
-      where p.clerk_user_id = $1 and op.org_id = $2 limit 1`,
-    [userId, res.locals.orgId],
-  );
-  const account = String(b.payeeAccount).trim();
-  const { rows } = await pool.query<{ id: string }>(
-    `insert into avenia_beneficiaries
-       (org_id, label, dest_hint, payee_legal_name, payee_country, payee_bank_psp, payee_account,
-        payee_memo, purpose_of_payment, source_of_funds, authorised_by)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning id`,
-    [
-      res.locals.orgId,
-      String(b.label).trim(),
-      account.slice(-4),
-      String(b.payeeLegalName).trim(),
-      String(b.payeeCountry).trim(),
-      String(b.payeeBankPsp).trim(),
-      account,
-      b.payeeMemo ? String(b.payeeMemo).trim() : null,
-      String(b.purposeOfPayment).trim(),
-      b.sourceOfFunds ? String(b.sourceOfFunds).trim() : null,
-      ap[0]?.id ?? null,
-    ],
-  );
-  res.json({ id: rows[0]!.id });
+  res.json(await createBeneficiaryForOrg(res.locals.orgId, userId, (req.body ?? {}) as Record<string, unknown>));
 });
 
 // --- Admin (internal) — service-token gated; the admin app authenticates staff via
@@ -247,6 +203,33 @@ app.post("/admin/orgs/:id/verdict", requireAdminServiceToken, async (req: Reques
     remark: remark ? String(remark) : undefined,
   });
   const { rows } = await pool.query("select id, state, admission_state from orgs where id = $1", [orgId]);
+  res.json(rows[0] ?? null);
+});
+
+// Suspend / block / reinstate an org's access (the 0002 access_status seam). Lifecycle
+// `state` is untouched — this is an operational gate, not an admission decision. The
+// mandatory reason is enforced in setOrgAccess and audit-logged as org.access_changed.
+app.post("/admin/orgs/:id/access", requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { adminClerkUserId, adminEmail, adminName, action, reason, source } = req.body ?? {};
+  if (!adminClerkUserId || !adminEmail) {
+    res.status(400).json({ error: "missing_admin_identity" });
+    return;
+  }
+  if (action !== "suspend" && action !== "block" && action !== "reinstate") {
+    res.status(400).json({ error: "invalid_action" });
+    return;
+  }
+  if (source !== undefined && source !== "lince_operational" && source !== "avenia_relay") {
+    res.status(400).json({ error: "invalid_source" });
+    return;
+  }
+  const orgId = String(req.params.id);
+  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  await setOrgAccess({ orgId, action, reason: String(reason ?? ""), source, changedByAdminId: adminId });
+  const { rows } = await pool.query(
+    "select id, state, access_status, access_reason, access_changed_at from orgs where id = $1",
+    [orgId],
+  );
   res.json(rows[0] ?? null);
 });
 

@@ -15,10 +15,11 @@ export interface OrgSnapshot {
   orgId: string;
   state: OrgState;
   admissionState: string;
+  accessStatus: string;
 }
 
 const SELECT_CALLER_ORG = `
-  select o.id, o.state, o.admission_state
+  select o.id, o.state, o.admission_state, o.access_status
     from people p
     join org_people op on op.person_id = p.id
     join orgs o on o.id = op.org_id
@@ -27,11 +28,12 @@ const SELECT_CALLER_ORG = `
    limit 1`;
 
 export async function currentOrgForClerkUser(clerkUserId: string): Promise<OrgSnapshot | null> {
-  const { rows } = await pool.query<{ id: string; state: OrgState; admission_state: string }>(SELECT_CALLER_ORG, [
-    clerkUserId,
-  ]);
+  const { rows } = await pool.query<{ id: string; state: OrgState; admission_state: string; access_status: string }>(
+    SELECT_CALLER_ORG,
+    [clerkUserId],
+  );
   const r = rows[0];
-  return r ? { orgId: r.id, state: r.state, admissionState: r.admission_state } : null;
+  return r ? { orgId: r.id, state: r.state, admissionState: r.admission_state, accessStatus: r.access_status } : null;
 }
 
 export async function advanceCallerOrg(clerkUserId: string, to: OrgState): Promise<OrgSnapshot> {
@@ -47,15 +49,20 @@ export async function advanceCallerOrg(clerkUserId: string, to: OrgState): Promi
     // Moving to vendor_pending = the KYB-L1 forward to Avenia -> stamps the
     // aging clock (orgs_admission_pending_ix / PRD-04 §4.3).
     const stampForward = to === "vendor_pending";
-    const upd = await c.query<{ state: OrgState; admission_state: string }>(
+    const upd = await c.query<{ state: OrgState; admission_state: string; access_status: string }>(
       `update orgs
           set state = $2,
               updated_at = now(),
               kyb_forwarded_at = case when $3 then now() else kyb_forwarded_at end
         where id = $1
-        returning state, admission_state`,
+        returning state, admission_state, access_status`,
       [org.id, to, stampForward],
     );
-    return { orgId: org.id, state: upd.rows[0]!.state, admissionState: upd.rows[0]!.admission_state };
+    return {
+      orgId: org.id,
+      state: upd.rows[0]!.state,
+      admissionState: upd.rows[0]!.admission_state,
+      accessStatus: upd.rows[0]!.access_status,
+    };
   });
 }

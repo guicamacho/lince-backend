@@ -23,8 +23,9 @@ set, so the test run (which sets `lince_test` inline) never touches the dev DB.
 
 ### Routes (Phase 1)
 - `GET  /healthz` — liveness + DB ping
-- `POST /onboarding/prescreen` — **completeness-only** pre-screen (Modelo A) → creates a `pending_lince_approval` org
+- `POST /onboarding/bootstrap` — authed (Clerk) signup bootstrap → person + `pending_lince_approval` org + owner
 - `POST /webhooks/:provider` — persists the raw event **only** (processing gated/stubbed)
+- `POST /admin/orgs/:id/access` — suspend/block/reinstate an org (service-token gated, audited)
 - `GET  /app/*` — behind the **active-org gate**. Dev auth seam: `x-org-id` header; real Clerk session→org resolution is a later milestone (PRD-02).
 
 ## What's here
@@ -33,7 +34,7 @@ set, so the test run (which sets `lince_test` inline) never touches the dev DB.
 - `src/modules/access` — the binary `org.state=active` gate.
 - `src/modules/onboarding/admission.service.ts` — the Avenia-verdict **relay** action.
 - `src/modules/providers` — Avenia signing harness + interfaces; vendor calls **stubbed**.
-- `src/modules/onboarding/prescreen.ts` — completeness-only pre-screen → org creation.
+- `src/modules/access/access.service.ts` — suspend/block/reinstate write path (0002 seam), audited.
 - `src/modules/identity/org.state.ts` — org lifecycle + `canTransition`/`assertTransition` guard.
 - `src/app.ts` — Express server (health, onboarding, webhook intake, the gate).
 - `test/` — `node:test` suites proving the safety floor (money, ledger balanced/append-only, admission relay, access, transitions).
