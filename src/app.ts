@@ -48,6 +48,10 @@ import { listBeneficiariesForOrg, createBeneficiaryForOrg } from "./modules/bene
 import { ensureAdminUser } from "./modules/identity/adminSync.js";
 import { requireAdminServiceToken } from "./modules/access/adminAuth.js";
 import { MockKybProvider } from "./modules/providers/didit/mock.kyb.js";
+import { getOrgDetail } from "./modules/admin/orgDetail.js";
+import { getAdmissionAging } from "./modules/admin/aging.js";
+import { recordAuditExport } from "./modules/admin/auditExport.js";
+import { enqueueApproval, listOpenApprovals, decideApproval, type ApprovalActionType } from "./modules/admin/approvals.js";
 
 export const app = express();
 // Capture the raw body (needed to verify webhook signatures) while still parsing JSON.
@@ -268,6 +272,87 @@ app.post("/admin/orgs/:id/access", rateLimit("admin_export"), requireAdminServic
     [orgId],
   );
   res.json(rows[0] ?? null);
+});
+
+// Org 360 read (A2) — lifecycle + access + admission (with submitted-at/elapsed) + team +
+// last-50 audit. References + status only (Modelo A). Plain read; NOT audited.
+app.get("/admin/orgs/:id", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  res.json(await getOrgDetail(String(req.params.id)));
+});
+
+// Admission aging + latency (A3) — the pending queue (breach-flagged) + p50/p90/p95 latency.
+// Threshold is env.sla.admissionDays (wall-clock).
+app.get("/admin/admissions/aging", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
+  res.json(await getAdmissionAging(env.sla.admissionDays));
+});
+
+// Export-audit sink (A1) — records that an admin exported rows (the CSV is built client-side).
+app.post("/admin/audit/export", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { adminClerkUserId, adminEmail, adminName, entity, filter, row_count } = req.body ?? {};
+  if (!adminClerkUserId || !adminEmail) {
+    res.status(400).json({ error: "missing_admin_identity" });
+    return;
+  }
+  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  await recordAuditExport({ adminId, entity: String(entity ?? ""), filter: filter ?? {}, rowCount: Number(row_count ?? 0) });
+  res.json({ ok: true });
+});
+
+// --- Maker-checker (A4). Enqueue a gated action; a SECOND operator decides it. ---
+const APPROVAL_ACTION_TYPES = ["admission_relay", "org_block", "reversal", "role_grant"] as const;
+
+// Enqueue a gated action (requested_by = the acting admin). Executes on a peer's approval.
+app.post("/admin/approvals", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { adminClerkUserId, adminEmail, adminName, action_type, target_ref, payload } = req.body ?? {};
+  if (!adminClerkUserId || !adminEmail) {
+    res.status(400).json({ error: "missing_admin_identity" });
+    return;
+  }
+  if (!APPROVAL_ACTION_TYPES.includes(action_type)) {
+    res.status(400).json({ error: "invalid_action_type" });
+    return;
+  }
+  if (!String(target_ref ?? "").trim()) {
+    res.status(400).json({ error: "target_ref_required" });
+    return;
+  }
+  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  res.status(201).json(
+    await enqueueApproval({
+      requestedByAdminId: adminId,
+      actionType: action_type as ApprovalActionType,
+      targetRef: String(target_ref),
+      payload: (payload ?? {}) as Record<string, unknown>,
+    }),
+  );
+});
+
+// Open approvals queue (oldest first) — drives the admin badge + queue view.
+app.get("/admin/approvals", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
+  res.json({ approvals: await listOpenApprovals() });
+});
+
+// Decide an open approval. CAS + maker-checker (403) + already-decided (409); on approve,
+// the executor runs in the same txn (org_block wired; others 501).
+app.post("/admin/approvals/:id/decide", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { adminClerkUserId, adminEmail, adminName, decision, remark } = req.body ?? {};
+  if (!adminClerkUserId || !adminEmail) {
+    res.status(400).json({ error: "missing_admin_identity" });
+    return;
+  }
+  if (decision !== "approved" && decision !== "declined") {
+    res.status(400).json({ error: "invalid_decision" });
+    return;
+  }
+  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  res.json(
+    await decideApproval({
+      id: String(req.params.id),
+      decidedByAdminId: adminId,
+      decision,
+      remark: remark ? String(remark) : undefined,
+    }),
+  );
 });
 
 // Error handler — Express 5 forwards rejected async handlers here.

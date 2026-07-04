@@ -8,6 +8,12 @@ test("permits legal transitions", () => {
   assert.ok(canTransition("rfi_required", "vendor_pending"));
 });
 
+test("rfi_required can relaunch verification (rfi_required -> kyb_in_progress)", () => {
+  // The RFI "Reiniciar verificação" CTA re-enters Didit; the transition must be legal.
+  assert.ok(canTransition("rfi_required", "kyb_in_progress"));
+  assert.doesNotThrow(() => assertTransition("rfi_required", "kyb_in_progress"));
+});
+
 test("rejects illegal transitions", () => {
   assert.equal(canTransition("active", "rejected"), false); // active is terminal
   assert.equal(canTransition("vendor_pending", "declined"), false);

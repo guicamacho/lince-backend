@@ -8,10 +8,25 @@
  * shared rateLimit("cnpj_lookup") middleware (WP-B13), not in-process here.
  */
 import { HttpError } from "../../http/error.js";
+import { pool } from "../../db/pool.js";
 
 export interface CnpjLookupResult {
   razaoSocial: string;
   ativa: boolean;
+  /** Live org with this CNPJ already exists on Lince (early duplicate feedback). */
+  alreadyRegistered: boolean;
+}
+
+/**
+ * Live-org duplicate check for early signup feedback. Deliberately does NOT consult
+ * cnpj_denylist: denylist status is never surfaced at lookup time (tipping-off-safe) —
+ * a denylisted CNPJ fails only at bootstrap, indistinguishable from other failures.
+ */
+export async function isCnpjRegistered(digits: string): Promise<boolean> {
+  const { rowCount } = await pool.query("select 1 from orgs where cnpj = $1 and deleted_at is null limit 1", [
+    digits,
+  ]);
+  return (rowCount ?? 0) > 0;
 }
 
 /** Digits-only 14-length CNPJ, else cnpj_invalid. */
@@ -28,7 +43,7 @@ interface CnpjResponse {
 }
 
 /** Map BrasilAPI's payload; empty razão social throws cnpj_no_name. */
-export function mapCnpjResponse(data: CnpjResponse): CnpjLookupResult {
+export function mapCnpjResponse(data: CnpjResponse): Omit<CnpjLookupResult, "alreadyRegistered"> {
   const razaoSocial = String(data.razao_social ?? "").trim();
   if (!razaoSocial) throw new HttpError("cnpj_no_name", 422);
   // ponytail: BrasilAPI returns both a code (2 = ATIVA) and a label — accept either.
@@ -56,5 +71,5 @@ export async function lookupCnpj(clerkUserId: string, rawCnpj: string): Promise<
     if (err instanceof HttpError) throw err;
     throw new HttpError("cnpj_lookup_unavailable", 502); // network / timeout / parse
   }
-  return mapCnpjResponse(data);
+  return { ...mapCnpjResponse(data), alreadyRegistered: await isCnpjRegistered(digits) };
 }

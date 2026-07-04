@@ -59,8 +59,14 @@ export const ROUTE_CLASSMAP: Record<string, RouteClass> = {
   "GET /app/beneficiaries": "reads",
   "POST /app/beneficiaries": "beneficiary_write",
   "GET /admin/orgs": "admin_export",
+  "GET /admin/orgs/:id": "admin_export",
   "POST /admin/orgs/:id/verdict": "admin_export",
   "POST /admin/orgs/:id/access": "admin_export",
+  "GET /admin/admissions/aging": "admin_export",
+  "POST /admin/audit/export": "admin_export",
+  "POST /admin/approvals": "admin_export",
+  "GET /admin/approvals": "admin_export",
+  "POST /admin/approvals/:id/decide": "admin_export",
   // Webhooks are classified but never throttled (providers retry). The class gives the
   // future volume-alarm a home; middleware short-circuits it to a no-op.
   "POST /webhooks/clerk": "webhook_exempt",

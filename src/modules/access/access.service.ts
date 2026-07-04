@@ -5,6 +5,7 @@
  * (admission stays Avenia's — see admission.service.ts). Every change carries a
  * mandatory reason and lands in audit_log as `org.access_changed`.
  */
+import type pg from "pg";
 import { withTransaction } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
 
@@ -27,13 +28,15 @@ const TARGET_STATUS: Record<AccessAction, string> = {
   reinstate: "active",
 };
 
-export async function setOrgAccess(input: SetOrgAccessInput): Promise<void> {
+// Pass `client` to join an existing transaction (the maker-checker decide executor does
+// this so the block and its approval commit atomically); omit it to run standalone.
+export async function setOrgAccess(input: SetOrgAccessInput, client?: pg.PoolClient): Promise<void> {
   const reason = input.reason.trim();
   // Compliance invariant: EVERY access change (including reinstate) records why.
   if (!reason) throw new HttpError("reason_required", 400);
 
-  await withTransaction(async (client) => {
-    const { rows } = await client.query<{ access_status: string }>(
+  const run = async (c: pg.PoolClient): Promise<void> => {
+    const { rows } = await c.query<{ access_status: string }>(
       `select access_status from orgs where id = $1 and deleted_at is null for update`,
       [input.orgId],
     );
@@ -42,7 +45,7 @@ export async function setOrgAccess(input: SetOrgAccessInput): Promise<void> {
 
     const to = TARGET_STATUS[input.action];
     const source = input.source ?? "lince_operational";
-    await client.query(
+    await c.query(
       `update orgs
           set access_status = $2,
               access_reason = $3,
@@ -54,7 +57,7 @@ export async function setOrgAccess(input: SetOrgAccessInput): Promise<void> {
       [input.orgId, to, reason, source, input.changedByAdminId],
     );
 
-    await client.query(
+    await c.query(
       `insert into audit_log (org_id, actor_type, actor_id, event, payload)
        values ($1, 'ops', $2, 'org.access_changed', $3)`,
       [
@@ -63,5 +66,7 @@ export async function setOrgAccess(input: SetOrgAccessInput): Promise<void> {
         JSON.stringify({ action: input.action, from, to, reason, source }),
       ],
     );
-  });
+  };
+
+  return client ? run(client) : withTransaction(run);
 }

@@ -11,6 +11,7 @@
  */
 import { withTransaction } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
+import { CONSENT_VERSIONS, type ConsentVersions } from "./consent.js";
 
 export interface BootstrapInput {
   cnpj?: string;
@@ -18,6 +19,9 @@ export interface BootstrapInput {
   role?: string; // the legal rep's job title (e.g. "CEO") — NOT an RBAC role
   fullName?: string;
   email?: string;
+  // Versioned ToS acceptance captured on the signup form; server defaults to the
+  // current CONSENT_VERSIONS if omitted. Recorded once per org (see step 4).
+  consent?: ConsentVersions;
 }
 
 export interface BootstrapResult {
@@ -89,6 +93,27 @@ export async function bootstrapOrgForClerkUser(clerkUserId: string, input: Boots
     await c.query(
       `insert into org_people (org_id, person_id, roles, status) values ($1,$2,'{owner,legal_rep}','active')`,
       [org.rows[0]!.id, personId],
+    );
+
+    // Versioned ToS-acceptance event — once per org (this branch only runs when a new
+    // org is created; idempotent re-calls short-circuit at step 2). Records who/when/
+    // which-version-of-each (PRD-02 AC-17). Client-supplied versions or the current set.
+    const consent = input.consent ?? CONSENT_VERSIONS;
+    await c.query(
+      `insert into audit_log (org_id, actor_type, actor_id, event, payload)
+       values ($1, 'user', $2, 'consent.accepted', $3)`,
+      [
+        org.rows[0]!.id,
+        personId,
+        JSON.stringify({
+          documents: [
+            { id: "avenia_terms", version: consent.avenia_terms },
+            { id: "lince_channel_terms", version: consent.lince_channel_terms },
+            { id: "lgpd_consent", version: consent.lgpd_consent },
+          ],
+          acceptedAt: new Date().toISOString(),
+        }),
+      ],
     );
     return { orgId: org.rows[0]!.id, state: org.rows[0]!.state };
   });

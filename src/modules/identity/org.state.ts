@@ -33,7 +33,7 @@ export const ORG_TRANSITIONS: Record<OrgState, OrgState[]> = {
   pending_lince_approval: ["kyb_in_progress", "declined"],
   kyb_in_progress: ["vendor_pending", "rfi_required", "declined"],
   vendor_pending: ["active", "rejected", "rfi_required"],
-  rfi_required: ["vendor_pending", "rejected"],
+  rfi_required: ["vendor_pending", "rejected", "kyb_in_progress"], // kyb_in_progress: RFI re-launches Didit (customer "Reiniciar verificação")
   active: [],
   declined: [],
   rejected: [],

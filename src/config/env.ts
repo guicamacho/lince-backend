@@ -66,4 +66,9 @@ export const env = {
   // Shared secret for server-to-server /admin/* calls from the admin app (which
   // authenticates staff via its own, separate Clerk instance).
   adminServiceToken: optional("ADMIN_SERVICE_TOKEN"),
+  // Admission SLA threshold (days) for the aging instrument (PRD-04 §4.3). Wall-clock
+  // per canon (business-day math is reserved for IFTI/SMR). Default 2.
+  sla: {
+    admissionDays: Number(optional("ADMISSION_SLA_DAYS") ?? 2),
+  },
 } as const;
