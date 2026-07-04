@@ -379,13 +379,20 @@ if (process.env.NODE_ENV !== "test") {
     replyTo: env.notify.replyTo,
     slackWebhookUrl: env.notify.slackWebhookUrl,
   };
+  // Single-flight: skip a tick if the previous one is still running, so a slow DB can't
+  // pile up overlapping drains and exhaust the connection pool.
+  let draining = false;
   setInterval(() => {
+    if (draining) return;
+    draining = true;
     void (async () => {
       try {
         await drainWebhooks();
         await drainOutboxOnce(notifyConfig);
       } catch (err) {
         console.warn("drain.tick_failed", err instanceof Error ? err.message : String(err));
+      } finally {
+        draining = false;
       }
     })();
   }, DRAIN_INTERVAL_MS);
