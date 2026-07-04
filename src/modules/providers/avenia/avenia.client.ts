@@ -40,4 +40,9 @@ export class AveniaClient implements RailProvider {
     // POST /v2/account/tickets?subAccountId=…  (lifecycle UNPAID->PROCESSING->PAID->FAILED)
     throw new Error("STUB: Avenia ticket gated on Wallets/Operations API mapping (BUILD_BRIEF §6)");
   }
+
+  async listTickets(_input: { subAccountId: string }): Promise<Ticket[]> {
+    // GET /v2/account/tickets?subAccountId=…  (webhook delivery-gap poll — B3/gapPoll)
+    throw new Error("STUB: Avenia listTickets gated on Wallets/Operations API mapping (BUILD_BRIEF §6)");
+  }
 }

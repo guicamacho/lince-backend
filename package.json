@@ -12,8 +12,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "migrate": "tsx db/migrate.ts",
     "dev": "tsx watch src/app.ts",
-    "pretest": "DATABASE_URL=postgres://localhost:5432/lince_test tsx db/migrate.ts",
-    "test": "DATABASE_URL=postgres://localhost:5432/lince_test node --import tsx --test --test-concurrency=1 'test/**/*.test.ts'"
+    "pretest": "NODE_ENV=test DATABASE_URL=postgres://localhost:5432/lince_test tsx db/migrate.ts",
+    "test": "NODE_ENV=test DATABASE_URL=postgres://localhost:5432/lince_test node --import tsx --test --test-concurrency=1 'test/**/*.test.ts'"
   },
   "dependencies": {
     "@clerk/express": "^2.1.32",

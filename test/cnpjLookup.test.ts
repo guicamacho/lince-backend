@@ -1,19 +1,15 @@
 /** CNPJ lookup — pure pieces only, no network. */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeCnpj, checkRateLimit, mapCnpjResponse } from "../src/modules/onboarding/cnpjLookup.js";
+import { normalizeCnpj, mapCnpjResponse } from "../src/modules/onboarding/cnpjLookup.js";
+
+// The per-user rate guard moved out of this module to the rateLimit("cnpj_lookup")
+// middleware (WP-B13); it's covered by test/rateLimiter.test.ts now.
 
 test("normalizeCnpj strips punctuation; rejects wrong length", () => {
   assert.equal(normalizeCnpj("11.222.333/0001-81"), "11222333000181");
   assert.throws(() => normalizeCnpj("123"), /cnpj_invalid/);
   assert.throws(() => normalizeCnpj(""), /cnpj_invalid/);
-});
-
-test("rate guard: 10/min per user, the 11th trips", () => {
-  const uid = `user_${Math.random()}`;
-  const now = 1_700_000_000_000; // fixed window so the 11 calls can't straddle a boundary
-  for (let i = 0; i < 10; i++) checkRateLimit(uid, now);
-  assert.throws(() => checkRateLimit(uid, now), /rate_limited/);
 });
 
 test("mapCnpjResponse: code 2 or label ATIVA => ativa true", () => {

@@ -1,10 +1,11 @@
 /**
  * Server-side CNPJ lookup (public Receita data via BrasilAPI) to pre-fill onboarding.
  *
- * Backend home for what the customer app did inline: normalize -> per-user rate
- * guard -> fetch razão social + situação. Modelo A: public company data only, no
- * KYC PII at rest — nothing here is persisted. Errors are thrown as HttpError so
- * app.ts maps them; the route (Wave 2) translates codes to neutral pt-BR strings.
+ * Backend home for what the customer app did inline: normalize -> fetch razão social
+ * + situação. Modelo A: public company data only, no KYC PII at rest — nothing here is
+ * persisted. Errors are thrown as HttpError so app.ts maps them; the route (Wave 2)
+ * translates codes to neutral pt-BR strings. Per-user throttling now lives in the
+ * shared rateLimit("cnpj_lookup") middleware (WP-B13), not in-process here.
  */
 import { HttpError } from "../../http/error.js";
 
@@ -18,24 +19,6 @@ export function normalizeCnpj(raw: string): string {
   const digits = (raw ?? "").replace(/\D/g, "");
   if (digits.length !== 14) throw new HttpError("cnpj_invalid", 422);
   return digits;
-}
-
-// ponytail: in-memory fixed-window, single-process only. Swap for the rate_limits
-// table via the B13 RateLimiter port when this runs multi-instance.
-const WINDOW_MS = 60_000;
-const LIMIT = 10;
-const hits = new Map<string, { windowStart: number; count: number }>();
-
-/** 10 lookups / minute per Clerk user; the 11th in a window throws rate_limited. */
-export function checkRateLimit(clerkUserId: string, now = Date.now()): void {
-  const windowStart = Math.floor(now / WINDOW_MS) * WINDOW_MS;
-  const cur = hits.get(clerkUserId);
-  if (!cur || cur.windowStart !== windowStart) {
-    hits.set(clerkUserId, { windowStart, count: 1 });
-    return;
-  }
-  if (cur.count >= LIMIT) throw new HttpError("rate_limited", 429);
-  cur.count += 1;
 }
 
 interface CnpjResponse {
@@ -53,9 +36,11 @@ export function mapCnpjResponse(data: CnpjResponse): CnpjLookupResult {
   return { razaoSocial, ativa };
 }
 
+// clerkUserId is retained for the route signature (app.ts) — throttling is now the
+// rateLimit("cnpj_lookup") middleware's job, so it is no longer read here.
 export async function lookupCnpj(clerkUserId: string, rawCnpj: string): Promise<CnpjLookupResult> {
+  void clerkUserId;
   const digits = normalizeCnpj(rawCnpj);
-  checkRateLimit(clerkUserId);
 
   let data: CnpjResponse;
   try {

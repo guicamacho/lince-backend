@@ -35,6 +35,34 @@ export const env = {
   stepUp: {
     enforced: process.env.STEP_UP_ENFORCED === "true",
   },
+  // Notification outbox (B6). Sending is OFF unless emailAdapter is "resend"; the
+  // default "log" adapter never touches the network. Slack is for admin alerts.
+  notify: {
+    emailAdapter: (optional("NOTIFY_EMAIL_ADAPTER") ?? "log") as "log" | "resend",
+    resendApiKey: optional("NOTIFY_RESEND_API_KEY"),
+    from: optional("NOTIFY_FROM"),
+    replyTo: optional("NOTIFY_REPLY_TO"),
+    slackWebhookUrl: optional("NOTIFY_SLACK_WEBHOOK_URL"),
+  },
+  // MFA policy (B15). Ruling (PRD-07 v5): optional by default (config-only flip to
+  // mandatory), SMS disabled, 24h post-recovery money-out hold.
+  mfa: {
+    policy: (process.env.MFA_POLICY === "mandatory" ? "mandatory" : "optional") as "optional" | "mandatory",
+    smsEnabled: process.env.MFA_SMS_ENABLED === "true",
+    recoveryHoldHours: Number(optional("RECOVERY_HOLD_HOURS") ?? 24),
+  },
+  // API rate limiting (B13). Off unless exactly "true" (dev/tests aren't throttled).
+  // webhookMaxBytes caps the JSON body express parses (webhook intake needs > 100kb).
+  rateLimit: {
+    enforced: process.env.RATE_LIMIT_ENFORCED === "true",
+    webhookMaxBytes: optional("WEBHOOK_MAX_BYTES") ?? "1mb",
+  },
+  // Inbound webhook signing secrets (B3). Clerk lives under clerk.webhookSigningSecret;
+  // resend is Svix-signed; avenia's inbound scheme is unconfirmed (verifier stays a stub).
+  webhooks: {
+    resendSecret: optional("RESEND_WEBHOOK_SECRET"),
+    aveniaSecret: optional("AVENIA_WEBHOOK_SECRET"),
+  },
   // Shared secret for server-to-server /admin/* calls from the admin app (which
   // authenticates staff via its own, separate Clerk instance).
   adminServiceToken: optional("ADMIN_SERVICE_TOKEN"),

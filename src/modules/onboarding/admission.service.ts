@@ -10,6 +10,7 @@
  * For BR, admission_authority MUST be 'avenia' — guarded below.
  */
 import { withTransaction } from "../../db/pool.js";
+import { enqueueNotification } from "../notifications/outbox.js";
 
 export interface RecordAveniaVerdictInput {
   orgId: string;
@@ -78,5 +79,15 @@ export async function recordAveniaVerdict(input: RecordAveniaVerdictInput): Prom
         [input.orgId, input.aveniaReference],
       );
     }
+
+    // B6: notify the customer in the SAME txn — the row exists iff this verdict commits.
+    // ponytail: recipient_ref = org id; resolve to an address at send time when Resend
+    //   lands (sending is off in P1, LogAdapter default). Rejection copy is neutral.
+    await enqueueNotification(client, {
+      eventType: input.decision === "approved" ? "activation_approved" : "application_rejected",
+      recipientRef: input.orgId,
+      templateId: input.decision === "approved" ? "activation_approved" : "application_rejected",
+      payload: { aveniaReference: input.aveniaReference },
+    });
   });
 }

@@ -28,6 +28,8 @@ export interface RailProvider {
     sourceAmount: bigint;
   }): Promise<Quote>;
   createTicket(input: { subAccountId: string; quoteToken: string }): Promise<Ticket>;
+  /** List a subaccount's tickets — used by the webhook delivery-gap poll (B3). STUBBED. */
+  listTickets(input: { subAccountId: string }): Promise<Ticket[]>;
 }
 
 /** KYC/KYB capture provider (Didit). Capture/forward is STUBBED. */

@@ -7,13 +7,21 @@
  *               POST /onboarding/launch-verification  — (authed) pending -> kyb_in_progress (Didit launch, mocked)
  *               POST /onboarding/mock-verify          — (authed) kyb_in_progress -> vendor_pending (mock Didit complete)
  *               POST /onboarding/cnpj-lookup          — (authed) public Receita lookup (BrasilAPI) to pre-fill signup
- *   Intake:     POST /webhooks/:provider             — persist raw event ONLY (processing is gated/stubbed)
+ *   Intake:     POST /webhooks/clerk                 — Svix-verified; delegates to the webhook inbox module
+ *               POST /webhooks/:provider             — verify (resend Svix) or store-only (avenia/didit); never throttled
  *   Gated app:  everything under /app                 — requires a Clerk session + an active org
  *                                                       POST /app/beneficiaries also step-up-gated (STEP_UP_ENFORCED)
+ *                                                       and MFA-gated (MFA_POLICY, optional by default)
  *   Admin:      /admin/*                              — service-token gated; the admin app authenticates staff
  *                                                       via its own Clerk instance, then calls server-to-server.
  *                                                       approve = recordAveniaVerdict relay (Modelo A).
  *                                                       access = setOrgAccess (suspend/block/reinstate, audited).
+ *
+ * Every route carries a rate-limit class (rateLimit(routeClass), gated by RATE_LIMIT_ENFORCED);
+ * the class map lives in modules/ratelimit/routeClasses.ts and test/routeClassRegistry.test.ts
+ * fails CI if any mounted route is neither classified nor exempt. Webhooks are webhook_exempt
+ * (providers retry, so they're never 429'd). A guarded scheduler drains the webhook + notification
+ * outboxes in-process (skipped under NODE_ENV=test, alongside the guarded app.listen).
  *
  * Auth = Clerk (@clerk/express). Customer routes map the Clerk user (getAuth.userId)
  * -> people.clerk_user_id -> org. Modelo A: Clerk carries auth identity ONLY — no
@@ -26,12 +34,15 @@ import { clerkMiddleware, getAuth } from "@clerk/express";
 import { pool } from "./db/pool.js";
 import { activeOrgForClerkUser } from "./modules/access/orgContext.js";
 import { setOrgAccess } from "./modules/access/access.service.js";
-import { linkClerkUserFromEvent } from "./modules/identity/clerkSync.js";
-import { Webhook } from "svix";
 import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
 import { requireStepUp } from "./modules/access/requireStepUp.js";
+import { requireMfa } from "./modules/access/requireMfa.js";
+import { rateLimit } from "./modules/ratelimit/middleware.js";
+import { receiveWebhook } from "./modules/webhooks/inbox.js";
+import { drainWebhooks } from "./modules/webhooks/processor.js";
+import { drainOutboxOnce } from "./modules/notifications/outbox.js";
 import { recordAveniaVerdict } from "./modules/onboarding/admission.service.js";
 import { listBeneficiariesForOrg, createBeneficiaryForOrg } from "./modules/beneficiaries/beneficiaries.service.js";
 import { ensureAdminUser } from "./modules/identity/adminSync.js";
@@ -40,7 +51,12 @@ import { MockKybProvider } from "./modules/providers/didit/mock.kyb.js";
 
 export const app = express();
 // Capture the raw body (needed to verify webhook signatures) while still parsing JSON.
-app.use(express.json({ verify: (req, _res, buf) => { (req as unknown as { rawBody?: Buffer }).rawBody = buf; } }));
+// Limit lifted to env.rateLimit.webhookMaxBytes (default 1mb) so webhook payloads aren't
+// truncated by express's 100kb default; other route bodies are tiny (flagged: global change).
+app.use(express.json({
+  limit: env.rateLimit.webhookMaxBytes,
+  verify: (req, _res, buf) => { (req as unknown as { rawBody?: Buffer }).rawBody = buf; },
+}));
 // Attach Clerk auth context to every request (does not enforce; routes opt in).
 app.use(clerkMiddleware());
 
@@ -57,27 +73,58 @@ function requireClerkUserId(req: Request, res: Response): string | null {
   return userId;
 }
 
+// Per-provider inbound webhook secrets, resolved once from env for the verify registry.
+const webhookVerifierConfig = {
+  clerkSecret: env.clerk.webhookSigningSecret,
+  resendSecret: env.webhooks.resendSecret,
+  aveniaSecret: env.webhooks.aveniaSecret,
+};
+
+// Shared webhook route body: build the receipt input from the request and delegate to the
+// inbox module (verify → persist → dedupe). For clerk this is byte-for-byte the old behavior
+// (503 unconfigured / 400 bad sig / 202 {received:true}); linking now happens in the drain's
+// clerkHandler. External id prefers svix-id (clerk/resend) then x-event-id / body.id.
+async function handleWebhook(req: Request, res: Response, provider: string): Promise<void> {
+  const body = (req.body ?? {}) as { id?: unknown; type?: unknown };
+  const externalId = String(req.header("svix-id") ?? req.header("x-event-id") ?? body.id ?? randomUUID());
+  const outcome = await receiveWebhook({
+    provider,
+    externalId,
+    eventType: String(body.type ?? "unknown"),
+    rawBody: (req as unknown as { rawBody?: Buffer }).rawBody?.toString("utf8") ?? "",
+    payload: req.body ?? {},
+    headers: {
+      "svix-id": req.header("svix-id"),
+      "svix-timestamp": req.header("svix-timestamp"),
+      "svix-signature": req.header("svix-signature"),
+    },
+    config: webhookVerifierConfig,
+    clientIp: req.ip,
+  });
+  res.status(outcome.status).json(outcome.body);
+}
+
 app.get("/healthz", async (_req: Request, res: Response) => {
   await pool.query("select 1");
   res.json({ ok: true });
 });
 
 // Bootstrap on signup (authed): person + org(pending) + owner. Captures CNPJ/name/role; NO CPF.
-app.post("/onboarding/bootstrap", async (req: Request, res: Response) => {
+app.post("/onboarding/bootstrap", rateLimit("signup_start"), async (req: Request, res: Response) => {
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
   res.status(201).json(await bootstrapOrgForClerkUser(uid, req.body ?? {}));
 });
 
 // Read the caller's org state (drives the customer shell gate). null if no org yet.
-app.get("/onboarding/state", async (req: Request, res: Response) => {
+app.get("/onboarding/state", rateLimit("reads"), async (req: Request, res: Response) => {
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
   res.json(await currentOrgForClerkUser(uid));
 });
 
 // "Start verification": launch Didit (mocked) -> kyb_in_progress.
-app.post("/onboarding/launch-verification", async (req: Request, res: Response) => {
+app.post("/onboarding/launch-verification", rateLimit("signup_start"), async (req: Request, res: Response) => {
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
   const snap = await advanceCallerOrg(uid, "kyb_in_progress");
@@ -86,15 +133,16 @@ app.post("/onboarding/launch-verification", async (req: Request, res: Response) 
 });
 
 // Mock Didit complete + forward to Avenia -> vendor_pending (under review).
-app.post("/onboarding/mock-verify", async (req: Request, res: Response) => {
+app.post("/onboarding/mock-verify", rateLimit("signup_start"), async (req: Request, res: Response) => {
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
   res.json(await advanceCallerOrg(uid, "vendor_pending"));
 });
 
 // Public Receita lookup (BrasilAPI) to pre-fill the signup form. Authed so it's not an
-// open CNPJ proxy; per-user rate-guarded. Modelo A: public company data only, nothing persisted.
-app.post("/onboarding/cnpj-lookup", async (req: Request, res: Response) => {
+// open CNPJ proxy; rate-limited via the cnpj_lookup class (the in-memory guard was removed).
+// Modelo A: public company data only, nothing persisted.
+app.post("/onboarding/cnpj-lookup", rateLimit("cnpj_lookup"), async (req: Request, res: Response) => {
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
   res.json(await lookupCnpj(uid, String(req.body?.cnpj ?? "")));
@@ -102,45 +150,16 @@ app.post("/onboarding/cnpj-lookup", async (req: Request, res: Response) => {
 
 // Clerk webhook — SIGNATURE-VERIFIED (Svix). Registered before the generic /webhooks/:provider.
 // This is the control that keeps the endpoint from being "open to everyone": no valid
-// Svix signature -> rejected. (IP allowlisting, if ever wanted, belongs at the edge/Fly.)
-app.post("/webhooks/clerk", async (req: Request, res: Response) => {
-  const secret = env.clerk.webhookSigningSecret;
-  if (!secret) {
-    res.status(503).json({ error: "webhook_not_configured" });
-    return;
-  }
-  const raw = (req as unknown as { rawBody?: Buffer }).rawBody?.toString("utf8") ?? "";
-  let event: { type: string; data: unknown };
-  try {
-    event = new Webhook(secret).verify(raw, {
-      "svix-id": req.header("svix-id") ?? "",
-      "svix-timestamp": req.header("svix-timestamp") ?? "",
-      "svix-signature": req.header("svix-signature") ?? "",
-    }) as { type: string; data: unknown };
-  } catch {
-    res.status(400).json({ error: "invalid_signature" });
-    return;
-  }
-  await pool.query(
-    `insert into webhook_events (provider_code, external_event_id, event_type, payload)
-     values ('clerk', $1, $2, $3)
-     on conflict (provider_code, external_event_id) do nothing`,
-    [req.header("svix-id") ?? randomUUID(), event.type, JSON.stringify(event)],
-  );
-  await linkClerkUserFromEvent(event as Parameters<typeof linkClerkUserFromEvent>[0]);
-  res.status(202).json({ received: true });
+// Svix signature -> rejected. Delegated to the webhook inbox module; the drain scheduler's
+// clerkHandler links the user from the stored event (idempotent). Never throttled.
+app.post("/webhooks/clerk", rateLimit("webhook_exempt"), async (req: Request, res: Response) => {
+  await handleWebhook(req, res, "clerk");
 });
 
-// Generic webhook intake — store the raw event; do NOT process (gated on vendor payload mapping).
-app.post("/webhooks/:provider", async (req: Request, res: Response) => {
-  const externalId = String(req.header("x-event-id") ?? req.body?.id ?? randomUUID());
-  await pool.query(
-    `insert into webhook_events (provider_code, external_event_id, event_type, payload)
-     values ($1, $2, $3, $4)
-     on conflict (provider_code, external_event_id) do nothing`,
-    [req.params.provider, externalId, String(req.body?.type ?? "unknown"), JSON.stringify(req.body ?? {})],
-  );
-  res.status(202).json({ received: true });
+// Generic webhook intake — resend is Svix-verified; avenia/didit are stored-only (scheme
+// unconfirmed) until processing lands. Delegated to the same inbox module. Never throttled.
+app.post("/webhooks/:provider", rateLimit("webhook_exempt"), async (req: Request, res: Response) => {
+  await handleWebhook(req, res, String(req.params.provider));
 });
 
 // The ONE access gate: a valid Clerk session AND an active org.
@@ -161,7 +180,7 @@ app.use("/app", async (req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-app.get("/app/me", async (_req: Request, res: Response) => {
+app.get("/app/me", rateLimit("reads"), async (_req: Request, res: Response) => {
   const { rows } = await pool.query("select id, razao_social, state from orgs where id = $1", [res.locals.orgId]);
   res.json(rows[0] ?? null);
 });
@@ -169,18 +188,24 @@ app.get("/app/me", async (_req: Request, res: Response) => {
 // Beneficiaries — travel-rule capture (AUSTRAC §4 / 255033346). The customer captures payee
 // tracing info; Lince retains it and forwards to Avenia later (mocked in P1, so
 // avenia_beneficiary_id stays null). The /app gate has set res.locals.orgId.
-app.get("/app/beneficiaries", async (_req: Request, res: Response) => {
+app.get("/app/beneficiaries", rateLimit("reads"), async (_req: Request, res: Response) => {
   res.json({ beneficiaries: await listBeneficiariesForOrg(res.locals.orgId) });
 });
 
-app.post("/app/beneficiaries", requireStepUp(env.stepUp.enforced), async (req: Request, res: Response) => {
-  const { userId } = getAuth(req);
-  res.json(await createBeneficiaryForOrg(res.locals.orgId, userId, (req.body ?? {}) as Record<string, unknown>));
-});
+app.post(
+  "/app/beneficiaries",
+  rateLimit("beneficiary_write"),
+  requireStepUp(env.stepUp.enforced),
+  requireMfa(env.mfa.policy),
+  async (req: Request, res: Response) => {
+    const { userId } = getAuth(req);
+    res.json(await createBeneficiaryForOrg(res.locals.orgId, userId, (req.body ?? {}) as Record<string, unknown>));
+  },
+);
 
 // --- Admin (internal) — service-token gated; the admin app authenticates staff via
 //     its own (separate) Clerk instance, then calls these server-to-server. ---
-app.get("/admin/orgs", requireAdminServiceToken, async (_req: Request, res: Response) => {
+app.get("/admin/orgs", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
   const { rows } = await pool.query(
     `select id, cnpj, razao_social, state, admission_state, access_status, kyb_forwarded_at, created_at
        from orgs where deleted_at is null order by created_at desc limit 200`,
@@ -191,7 +216,7 @@ app.get("/admin/orgs", requireAdminServiceToken, async (_req: Request, res: Resp
 // Record Avenia's decision (the relay gate). approved -> org active; rejected -> rejected +
 // CNPJ denylist (with the mandatory reason). Audit-logged AS A RELAY inside recordAveniaVerdict.
 // Modelo A: this records Avenia's verdict, not a Lince adjudication.
-app.post("/admin/orgs/:id/verdict", requireAdminServiceToken, async (req: Request, res: Response) => {
+app.post("/admin/orgs/:id/verdict", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
   const { adminClerkUserId, adminEmail, adminName, decision, aveniaReference, remark } = req.body ?? {};
   if (!adminClerkUserId || !adminEmail) {
     res.status(400).json({ error: "missing_admin_identity" });
@@ -221,7 +246,7 @@ app.post("/admin/orgs/:id/verdict", requireAdminServiceToken, async (req: Reques
 // Suspend / block / reinstate an org's access (the 0002 access_status seam). Lifecycle
 // `state` is untouched — this is an operational gate, not an admission decision. The
 // mandatory reason is enforced in setOrgAccess and audit-logged as org.access_changed.
-app.post("/admin/orgs/:id/access", requireAdminServiceToken, async (req: Request, res: Response) => {
+app.post("/admin/orgs/:id/access", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
   const { adminClerkUserId, adminEmail, adminName, action, reason, source } = req.body ?? {};
   if (!adminClerkUserId || !adminEmail) {
     res.status(400).json({ error: "missing_admin_identity" });
@@ -252,5 +277,31 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(status).json({ error: err instanceof Error ? err.message : "internal_error" });
 });
 
-const port = Number(process.env.PORT ?? 3000);
-app.listen(port, () => console.log(`lince-phase1 listening on :${port} — Avenia ${env.avenia.baseUrl}`));
+// Entry side-effects. Guarded so importing `app` in tests (routeClassRegistry walks the
+// router) neither binds a port nor starts the drain. NODE_ENV=test is set in the test script.
+// ponytail: guarded listen over an app/server split; extract src/server.ts only if a second
+// real entry point appears.
+const DRAIN_INTERVAL_MS = Number(process.env.DRAIN_INTERVAL_MS ?? 5000);
+if (process.env.NODE_ENV !== "test") {
+  const port = Number(process.env.PORT ?? 3000);
+  app.listen(port, () => console.log(`lince-phase1 listening on :${port} — Avenia ${env.avenia.baseUrl}`));
+  // Single in-process scheduler drains both outboxes. Both claims use FOR UPDATE SKIP LOCKED,
+  // so a second machine is safe (wasteful, not wrong). One tick failing is logged, not fatal.
+  const notifyConfig = {
+    emailAdapter: env.notify.emailAdapter,
+    resendApiKey: env.notify.resendApiKey,
+    from: env.notify.from,
+    replyTo: env.notify.replyTo,
+    slackWebhookUrl: env.notify.slackWebhookUrl,
+  };
+  setInterval(() => {
+    void (async () => {
+      try {
+        await drainWebhooks();
+        await drainOutboxOnce(notifyConfig);
+      } catch (err) {
+        console.warn("drain.tick_failed", err instanceof Error ? err.message : String(err));
+      }
+    })();
+  }, DRAIN_INTERVAL_MS);
+}
