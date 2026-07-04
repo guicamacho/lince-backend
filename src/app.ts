@@ -6,8 +6,10 @@
  *               GET  /onboarding/state               — (authed) caller's org state (drives the shell gate)
  *               POST /onboarding/launch-verification  — (authed) pending -> kyb_in_progress (Didit launch, mocked)
  *               POST /onboarding/mock-verify          — (authed) kyb_in_progress -> vendor_pending (mock Didit complete)
+ *               POST /onboarding/cnpj-lookup          — (authed) public Receita lookup (BrasilAPI) to pre-fill signup
  *   Intake:     POST /webhooks/:provider             — persist raw event ONLY (processing is gated/stubbed)
  *   Gated app:  everything under /app                 — requires a Clerk session + an active org
+ *                                                       POST /app/beneficiaries also step-up-gated (STEP_UP_ENFORCED)
  *   Admin:      /admin/*                              — service-token gated; the admin app authenticates staff
  *                                                       via its own Clerk instance, then calls server-to-server.
  *                                                       approve = recordAveniaVerdict relay (Modelo A).
@@ -27,7 +29,9 @@ import { setOrgAccess } from "./modules/access/access.service.js";
 import { linkClerkUserFromEvent } from "./modules/identity/clerkSync.js";
 import { Webhook } from "svix";
 import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
+import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
+import { requireStepUp } from "./modules/access/requireStepUp.js";
 import { recordAveniaVerdict } from "./modules/onboarding/admission.service.js";
 import { listBeneficiariesForOrg, createBeneficiaryForOrg } from "./modules/beneficiaries/beneficiaries.service.js";
 import { ensureAdminUser } from "./modules/identity/adminSync.js";
@@ -86,6 +90,14 @@ app.post("/onboarding/mock-verify", async (req: Request, res: Response) => {
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
   res.json(await advanceCallerOrg(uid, "vendor_pending"));
+});
+
+// Public Receita lookup (BrasilAPI) to pre-fill the signup form. Authed so it's not an
+// open CNPJ proxy; per-user rate-guarded. Modelo A: public company data only, nothing persisted.
+app.post("/onboarding/cnpj-lookup", async (req: Request, res: Response) => {
+  const uid = requireClerkUserId(req, res);
+  if (!uid) return;
+  res.json(await lookupCnpj(uid, String(req.body?.cnpj ?? "")));
 });
 
 // Clerk webhook — SIGNATURE-VERIFIED (Svix). Registered before the generic /webhooks/:provider.
@@ -161,7 +173,7 @@ app.get("/app/beneficiaries", async (_req: Request, res: Response) => {
   res.json({ beneficiaries: await listBeneficiariesForOrg(res.locals.orgId) });
 });
 
-app.post("/app/beneficiaries", async (req: Request, res: Response) => {
+app.post("/app/beneficiaries", requireStepUp(env.stepUp.enforced), async (req: Request, res: Response) => {
   const { userId } = getAuth(req);
   res.json(await createBeneficiaryForOrg(res.locals.orgId, userId, (req.body ?? {}) as Record<string, unknown>));
 });
