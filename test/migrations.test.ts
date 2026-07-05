@@ -1,4 +1,4 @@
-/** Migration smoke tests — one block per WP-B1 migration (0005–0007). */
+/** Migration smoke tests — one block per WP-B1 migration (0005–0008). */
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { pool } from "../src/db/pool.js";
@@ -67,6 +67,41 @@ test("0006 lifecycle + outbox + beneficiaries + cases re-cut", async () => {
   // cases: accepts new 'recon_break', rejects gated 'aml_alert'
   await pool.query("insert into cases (type) values ('recon_break')");
   await assert.rejects(pool.query("insert into cases (type) values ('aml_alert')"));
+});
+
+test("0008 case correspondence — append-only messages + customer inbox", async () => {
+  const orgId = await createOrg("active");
+  const { rows: c } = await pool.query<{ id: string }>(
+    "insert into cases (type, org_id) values ('rfi_relay', $1) returning id",
+    [orgId],
+  );
+  const caseId = c[0]!.id;
+
+  // case_messages.customer_visible defaults false
+  const { rows: m } = await pool.query<{ id: string; customer_visible: boolean }>(
+    "insert into case_messages (case_id, author_type, body) values ($1, 'admin', 'hi') returning id, customer_visible",
+    [caseId],
+  );
+  assert.equal(m[0]!.customer_visible, false);
+
+  // author_type CHECK rejects a bogus value
+  await assert.rejects(
+    pool.query("insert into case_messages (case_id, author_type, body) values ($1, 'robot', 'x')", [caseId]),
+  );
+
+  // append-only: both UPDATE and DELETE are rejected (7-yr correspondence record)
+  await assert.rejects(pool.query("update case_messages set body = 'edited' where id = $1", [m[0]!.id]));
+  await assert.rejects(pool.query("delete from case_messages where id = $1", [m[0]!.id]));
+
+  // customer_notifications: read_at null default + kind CHECK rejects a bogus value
+  const { rows: n } = await pool.query<{ read_at: string | null }>(
+    "insert into customer_notifications (org_id, kind, title, body) values ($1, 'case_message', 't', 'b') returning read_at",
+    [orgId],
+  );
+  assert.equal(n[0]!.read_at, null);
+  await assert.rejects(
+    pool.query("insert into customer_notifications (org_id, kind, title, body) values ($1, 'bogus', 't', 'b')", [orgId]),
+  );
 });
 
 test("0007 rate_limits fixed-window UPSERT increments", async () => {

@@ -5,7 +5,8 @@ import { pool } from "../src/db/pool.js";
 // provider_currencies) are intentionally NOT truncated.
 const DATA_TABLES = [
   "recon_breaks", "recon_runs", "notification_outbox", "rate_limits",
-  "audit_log", "cnpj_denylist", "webhook_events", "cases",
+  "audit_log", "cnpj_denylist", "webhook_events",
+  "customer_notifications", "case_messages", "cases",
   "ledger_postings", "ledger_transactions", "ledger_accounts", "org_transactions",
   "avenia_beneficiaries", "didit_verifications", "avenia_accounts",
   "org_people", "orgs", "people", "admin_users",
@@ -30,6 +31,18 @@ export async function createOrg(
   const { rows } = await pool.query<{ id: string }>(
     `insert into orgs (cnpj, razao_social, country_code, state) values ($1, 'Test Ltda', 'BR', $2) returning id`,
     [cnpj, state],
+  );
+  return rows[0]!.id;
+}
+
+export async function insertCase(
+  type = "rfi_relay",
+  orgId: string | null = null,
+  openedBy: string | null = null,
+): Promise<string> {
+  const { rows } = await pool.query<{ id: string }>(
+    `insert into cases (type, org_id, opened_by) values ($1, $2, $3) returning id`,
+    [type, orgId, openedBy],
   );
   return rows[0]!.id;
 }

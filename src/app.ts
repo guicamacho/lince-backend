@@ -52,6 +52,15 @@ import { getOrgDetail } from "./modules/admin/orgDetail.js";
 import { getAdmissionAging } from "./modules/admin/aging.js";
 import { recordAuditExport } from "./modules/admin/auditExport.js";
 import { enqueueApproval, listOpenApprovals, decideApproval, type ApprovalActionType } from "./modules/admin/approvals.js";
+import { createCase, listCases, getCaseDetail, assignCase, updateCaseStatus } from "./modules/cases/cases.service.js";
+import { postAdminCaseMessage } from "./modules/cases/messages.service.js";
+import {
+  listNotificationsForOrg,
+  markNotificationRead,
+  listCustomerCasesForOrg,
+  getCaseThreadForOrg,
+  postCustomerCaseReply,
+} from "./modules/cases/customerInbox.service.js";
 
 export const app = express();
 // Capture the raw body (needed to verify webhook signatures) while still parsing JSON.
@@ -207,6 +216,33 @@ app.post(
   },
 );
 
+// --- Customer inbox ("Avisos") — behind the /app gate; org implicit via res.locals.orgId.
+//     In-app only (D2, no email). L4 of the tipping-off model: every read is org-scoped and
+//     returns only customer_visible messages on allowlisted-type cases. ---
+app.get("/app/notifications", rateLimit("reads"), async (_req: Request, res: Response) => {
+  res.json(await listNotificationsForOrg(res.locals.orgId));
+});
+
+app.post("/app/notifications/:id/read", rateLimit("reads"), async (req: Request, res: Response) => {
+  res.json(await markNotificationRead(res.locals.orgId, String(req.params.id)));
+});
+
+app.get("/app/cases", rateLimit("reads"), async (_req: Request, res: Response) => {
+  res.json({ cases: await listCustomerCasesForOrg(res.locals.orgId) });
+});
+
+app.get("/app/cases/:id/messages", rateLimit("reads"), async (req: Request, res: Response) => {
+  res.json(await getCaseThreadForOrg(res.locals.orgId, String(req.params.id)));
+});
+
+// Reply-only (D1): customers reply to a staff-opened case, they do not open cases in v1.
+app.post("/app/cases/:id/messages", rateLimit("beneficiary_write"), async (req: Request, res: Response) => {
+  const { userId } = getAuth(req);
+  res.status(201).json(
+    await postCustomerCaseReply(res.locals.orgId, userId, String(req.params.id), String(req.body?.body ?? "")),
+  );
+});
+
 // --- Admin (internal) — service-token gated; the admin app authenticates staff via
 //     its own (separate) Clerk instance, then calls these server-to-server. ---
 app.get("/admin/orgs", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
@@ -353,6 +389,72 @@ app.post("/admin/approvals/:id/decide", rateLimit("admin_export"), requireAdminS
       remark: remark ? String(remark) : undefined,
     }),
   );
+});
+
+// --- Admin compliance cases — service-token gated. Operational taxonomy only (AML absent).
+//     The customer-visibility wall lives in the service (messages.service messageCanBeCustomerVisible). ---
+app.post("/admin/cases", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { adminClerkUserId, adminEmail, adminName, org_id, type, priority, summary } = req.body ?? {};
+  if (!adminClerkUserId || !adminEmail) {
+    res.status(400).json({ error: "missing_admin_identity" });
+    return;
+  }
+  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  res.status(201).json(
+    await createCase({
+      orgId: org_id ? String(org_id) : null,
+      type: String(type ?? ""),
+      priority: priority ? String(priority) : undefined,
+      summary: summary ? String(summary) : undefined,
+      openedByAdminId: adminId,
+    }),
+  );
+});
+
+app.get("/admin/cases", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  res.json({
+    cases: await listCases({
+      type: req.query.type ? String(req.query.type) : undefined,
+      status: req.query.status ? String(req.query.status) : undefined,
+      orgId: req.query.org_id ? String(req.query.org_id) : undefined,
+    }),
+  });
+});
+
+app.get("/admin/cases/:id", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  res.json(await getCaseDetail(String(req.params.id)));
+});
+
+app.post("/admin/cases/:id/messages", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { adminClerkUserId, adminEmail, adminName, body, customer_visible } = req.body ?? {};
+  if (!adminClerkUserId || !adminEmail) {
+    res.status(400).json({ error: "missing_admin_identity" });
+    return;
+  }
+  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  res.status(201).json(
+    await postAdminCaseMessage({
+      caseId: String(req.params.id),
+      authorAdminId: adminId,
+      body: String(body ?? ""),
+      customerVisible: customer_visible === true,
+    }),
+  );
+});
+
+app.post("/admin/cases/:id/status", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { status, resolution } = req.body ?? {};
+  res.json(
+    await updateCaseStatus({
+      caseId: String(req.params.id),
+      status: String(status ?? ""),
+      resolution: resolution ? String(resolution) : undefined,
+    }),
+  );
+});
+
+app.post("/admin/cases/:id/assign", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  res.json(await assignCase(String(req.params.id), String(req.body?.assigned_admin_id ?? "")));
 });
 
 // Error handler — Express 5 forwards rejected async handlers here.
