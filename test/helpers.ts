@@ -13,6 +13,12 @@ const DATA_TABLES = [
 ];
 
 export async function resetDb(): Promise<void> {
+  // Hard guard: this truncate once wiped lince_dev when a test file was run directly
+  // (no npm script -> no DATABASE_URL override -> .env's dev DB). Refuse anything but lince_test.
+  const { rows } = await pool.query<{ db: string }>("select current_database() as db");
+  if (rows[0]!.db !== "lince_test") {
+    throw new Error(`resetDb refused: connected to '${rows[0]!.db}', not lince_test. Run tests via npm test.`);
+  }
   await pool.query(`truncate ${DATA_TABLES.join(", ")} restart identity cascade`);
 }
 
