@@ -5,6 +5,7 @@
 if (!process.env.DATABASE_URL) {
   try { process.loadEnvFile(); } catch { /* no .env file — rely on process.env */ }
 }
+import { resolvePem } from "./keys.js";
 
 function required(name: string): string {
   const v = process.env[name];
@@ -25,7 +26,8 @@ export const env = {
   avenia: {
     baseUrl: optional("AVENIA_BASE_URL") ?? "https://api.sandbox.avenia.io:10952",
     apiKey: optional("AVENIA_API_KEY"),
-    signingPrivateKey: optional("AVENIA_SIGNING_PRIVATE_KEY"),
+    // PEM via file path (AVENIA_SIGNING_KEY_FILE) or escaped/base64 env value.
+    signingPrivateKeyPem: resolvePem(optional("AVENIA_SIGNING_PRIVATE_KEY"), optional("AVENIA_SIGNING_KEY_FILE")),
   },
   didit: {
     apiKey: optional("DIDIT_API_KEY"),

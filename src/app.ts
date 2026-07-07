@@ -37,6 +37,8 @@ import { setOrgAccess } from "./modules/access/access.service.js";
 import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
+import { ensureAveniaSubaccount } from "./modules/onboarding/aveniaProvisioning.js";
+import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { requireStepUp } from "./modules/access/requireStepUp.js";
 import { requireMfa } from "./modules/access/requireMfa.js";
 import { rateLimit } from "./modules/ratelimit/middleware.js";
@@ -136,10 +138,18 @@ app.get("/onboarding/state", rateLimit("reads"), async (req: Request, res: Respo
   res.json(await currentOrgForClerkUser(uid));
 });
 
-// "Start verification": launch Didit (mocked) -> kyb_in_progress.
+// "Start verification": Avenia COMPANY subaccount first (Connectivity §3 — KYB runs
+// against it), then launch Didit (mocked) -> kyb_in_progress. ensure* is idempotent,
+// so the RFI re-launch path reuses the existing subaccount.
 app.post("/onboarding/launch-verification", rateLimit("signup_start"), async (req: Request, res: Response) => {
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
+  const current = await currentOrgForClerkUser(uid);
+  if (!current) {
+    res.status(404).json({ error: "no_org_for_user" });
+    return;
+  }
+  await ensureAveniaSubaccount(current.orgId, aveniaFromEnv());
   const snap = await advanceCallerOrg(uid, "kyb_in_progress");
   const session = await mockKyb.launchVerification({ orgId: snap.orgId });
   res.json({ ...snap, hostedUrl: session.hostedUrl });

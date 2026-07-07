@@ -12,9 +12,31 @@ import type { Currency } from "../../../money/money.js";
 import type { Quote, Ticket, RailProvider } from "../provider.types.js";
 import type { AveniaConfig } from "./avenia.types.js";
 import { aveniaSignedHeaders } from "./signing.js";
+import { env } from "../../../config/env.js";
 
-export class AveniaClient implements RailProvider {
+/** The one capability onboarding provisioning needs — lets tests inject a fake. */
+export interface SubAccountCreator {
+  createSubAccount(name: string): Promise<{ id: string }>;
+}
+
+export class AveniaClient implements RailProvider, SubAccountCreator {
   constructor(private readonly config: AveniaConfig) {}
+
+  /** COMPANY subaccount on the MAIN account (Connectivity §1/§3) — one per customer org.
+   *  Master-scoped: no subAccountId param. PERMANENT on Avenia (no delete). */
+  async createSubAccount(name: string): Promise<{ id: string }> {
+    const requestUri = "/v2/account/sub-accounts";
+    const body = JSON.stringify({ accountType: "COMPANY", name });
+    const res = await fetch(`${this.config.baseUrl}${requestUri}`, {
+      method: "POST",
+      headers: this.signedHeaders("POST", requestUri, body),
+      body,
+    });
+    if (!res.ok) throw new Error(`avenia sub-accounts ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const out = (await res.json()) as { id?: string };
+    if (!out.id) throw new Error("avenia sub-accounts: no id in response");
+    return { id: out.id };
+  }
 
   /** Build the signed headers for a request (X-API-Key/X-API-Timestamp/X-API-Signature). */
   private signedHeaders(method: string, requestUri: string, body?: string): Record<string, string> {
@@ -45,4 +67,15 @@ export class AveniaClient implements RailProvider {
     // GET /v2/account/tickets?subAccountId=…  (webhook delivery-gap poll — B3/gapPoll)
     throw new Error("STUB: Avenia listTickets gated on Wallets/Operations API mapping (BUILD_BRIEF §6)");
   }
+}
+
+// Composition point: the env-configured client, or null when keys are absent
+// (tests / keyless dev — callers must treat null as "Avenia disabled").
+let fromEnv: AveniaClient | null | undefined;
+export function aveniaFromEnv(): AveniaClient | null {
+  if (fromEnv === undefined) {
+    const { baseUrl, apiKey, signingPrivateKeyPem } = env.avenia;
+    fromEnv = apiKey && signingPrivateKeyPem ? new AveniaClient({ baseUrl, apiKey, signingPrivateKeyPem }) : null;
+  }
+  return fromEnv;
 }
