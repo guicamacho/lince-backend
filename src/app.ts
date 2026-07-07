@@ -103,13 +103,15 @@ const webhookVerifierConfig = {
 // clerkHandler. External id prefers svix-id (clerk/resend) then x-event-id / body.id.
 async function handleWebhook(req: Request, res: Response, provider: string): Promise<void> {
   const body = (req.body ?? {}) as { id?: unknown; type?: unknown; eventId?: unknown; eventType?: unknown };
+  // Avenia wraps everything: { event: { id, data: { type, ticket } } } (observed live 2026-07-07).
+  const avenia = (req.body as { event?: { id?: unknown; data?: { type?: unknown } } } | null)?.event;
   const externalId = String(
-    req.header("svix-id") ?? req.header("x-event-id") ?? body.id ?? body.eventId ?? randomUUID(),
+    req.header("svix-id") ?? req.header("x-event-id") ?? body.id ?? body.eventId ?? avenia?.id ?? randomUUID(),
   );
   const outcome = await receiveWebhook({
     provider,
     externalId,
-    eventType: String(body.type ?? body.eventType ?? "unknown"),
+    eventType: String(body.type ?? body.eventType ?? avenia?.data?.type ?? "unknown"),
     rawBody: (req as unknown as { rawBody?: Buffer }).rawBody?.toString("utf8") ?? "",
     payload: req.body ?? {},
     headers: {
