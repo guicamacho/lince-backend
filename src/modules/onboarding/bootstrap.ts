@@ -10,8 +10,18 @@
  * app may call this more than once around signup).
  */
 import { withTransaction } from "../../db/pool.js";
+import { acquireOrgOnboardingLock } from "../../db/lockKeys.js";
 import { HttpError } from "../../http/error.js";
 import { CONSENT_VERSIONS, type ConsentVersions } from "./consent.js";
+
+// unique_violation on the CNPJ partial-unique index (orgs_cnpj_active_uq, migration 0010).
+function isCnpjConflict(e: unknown): boolean {
+  return (
+    typeof e === "object" && e !== null &&
+    (e as { code?: string }).code === "23505" &&
+    (e as { constraint?: string }).constraint === "orgs_cnpj_active_uq"
+  );
+}
 
 export interface BootstrapInput {
   cnpj?: string;
@@ -45,6 +55,11 @@ export async function bootstrapOrgForClerkUser(clerkUserId: string, input: Boots
   if (missing.length) throw new HttpError(`incomplete: ${missing.join(", ")}`, 422);
 
   return withTransaction(async (c) => {
+    // Serialize concurrent signups for the same company (pattern 9). Keyed on the CNPJ
+    // because the org has no id yet; orgs_cnpj_active_uq is the DB backstop. Advisory lock
+    // FIRST, before any row locks (lock-ordering invariant).
+    await acquireOrgOnboardingLock(c, cnpj);
+
     // 1) person for this Clerk user: already linked, else attach to a matching
     //    login-person by email, else create a new login person.
     const linked = await c.query<{ id: string }>("select id from people where clerk_user_id = $1", [clerkUserId]);
@@ -78,21 +93,28 @@ export async function bootstrapOrgForClerkUser(clerkUserId: string, input: Boots
     );
     if (existing.rows[0]) return { orgId: existing.rows[0].id, state: existing.rows[0].state };
 
-    // 3) operational re-submission controls.
+    // 3) operational re-submission control: denylist stays a check (a separate table).
     const deny = await c.query("select 1 from cnpj_denylist where cnpj = $1", [cnpj]);
     if (deny.rowCount) throw new HttpError("cnpj_denylisted", 409);
-    const dup = await c.query("select 1 from orgs where cnpj = $1 and deleted_at is null", [cnpj]);
-    if (dup.rowCount) throw new HttpError("cnpj_already_registered", 409);
 
-    // 4) org (pending) + owner link.
-    const org = await c.query<{ id: string; state: string }>(
-      `insert into orgs (cnpj, razao_social, country_code, state, legal_rep_person_id, onboarding)
-       values ($1,$2,'BR','pending_lince_approval',$3,$4) returning id, state`,
-      [cnpj, razao, personId, JSON.stringify({ role: role || null, submittedAt: new Date().toISOString() })],
-    );
+    // 4) org (pending) + owner link. Insert-first against orgs_cnpj_active_uq (pattern 9):
+    //    a same-CNPJ duplicate loses on the unique index and routes to the existing 409 —
+    //    no check-then-insert TOCTOU. The onboarding lock above already serialises the race.
+    let orgRow: { id: string; state: string };
+    try {
+      const inserted = await c.query<{ id: string; state: string }>(
+        `insert into orgs (cnpj, razao_social, country_code, state, legal_rep_person_id, onboarding)
+         values ($1,$2,'BR','pending_lince_approval',$3,$4) returning id, state`,
+        [cnpj, razao, personId, JSON.stringify({ role: role || null, submittedAt: new Date().toISOString() })],
+      );
+      orgRow = inserted.rows[0]!;
+    } catch (e) {
+      if (isCnpjConflict(e)) throw new HttpError("cnpj_already_registered", 409);
+      throw e;
+    }
     await c.query(
       `insert into org_people (org_id, person_id, roles, status) values ($1,$2,'{owner,legal_rep}','active')`,
-      [org.rows[0]!.id, personId],
+      [orgRow.id, personId],
     );
 
     // Versioned ToS-acceptance event — once per org (this branch only runs when a new
@@ -103,7 +125,7 @@ export async function bootstrapOrgForClerkUser(clerkUserId: string, input: Boots
       `insert into audit_log (org_id, actor_type, actor_id, event, payload)
        values ($1, 'user', $2, 'consent.accepted', $3)`,
       [
-        org.rows[0]!.id,
+        orgRow.id,
         personId,
         JSON.stringify({
           documents: [
@@ -115,6 +137,6 @@ export async function bootstrapOrgForClerkUser(clerkUserId: string, input: Boots
         }),
       ],
     );
-    return { orgId: org.rows[0]!.id, state: org.rows[0]!.state };
+    return { orgId: orgRow.id, state: orgRow.state };
   });
 }

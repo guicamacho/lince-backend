@@ -10,6 +10,7 @@
  * For BR, admission_authority MUST be 'avenia' — guarded below.
  */
 import { withTransaction } from "../../db/pool.js";
+import { HttpError } from "../../http/error.js";
 import { enqueueNotification } from "../notifications/outbox.js";
 
 export interface RecordAveniaVerdictInput {
@@ -23,8 +24,8 @@ export interface RecordAveniaVerdictInput {
 export async function recordAveniaVerdict(input: RecordAveniaVerdictInput): Promise<void> {
   await withTransaction(async (client) => {
     // Guard: only relay where the jurisdiction's admission authority is Avenia (BR).
-    const { rows } = await client.query<{ admission_authority: string }>(
-      `select jp.admission_authority
+    const { rows } = await client.query<{ admission_authority: string; admission_state: string }>(
+      `select jp.admission_authority, o.admission_state
          from orgs o
          join jurisdiction_policies jp on jp.country_code = o.country_code
         where o.id = $1 and o.deleted_at is null
@@ -37,6 +38,10 @@ export async function recordAveniaVerdict(input: RecordAveniaVerdictInput): Prom
       // MX/CO (lince/local_partner) use a different path — and are gated on counsel anyway.
       throw new Error(`recordAveniaVerdict is for avenia-admission jurisdictions only (got ${authority})`);
     }
+    // CAS under the row lock (pattern 8): relay a verdict ONCE. A second relay (raced or
+    // retried) finds admission_state already decided -> a handled 409, never a silent
+    // re-write that could flip an approved org to rejected.
+    if (rows[0]!.admission_state !== "pending") throw new HttpError("admission_already_recorded", 409);
 
     const newOrgState = input.decision === "approved" ? "active" : "rejected";
     await client.query(

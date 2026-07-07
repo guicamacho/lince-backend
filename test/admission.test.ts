@@ -38,6 +38,20 @@ test("rejected -> org rejected + CNPJ denylisted", async () => {
   assert.equal(deny.rowCount, 1);
 });
 
+test("a second relay on an already-decided org -> admission_already_recorded (CAS, pattern 8)", async () => {
+  const admin = await createAdmin();
+  const org = await createOrg("vendor_pending");
+  await recordAveniaVerdict({ orgId: org, decision: "approved", aveniaReference: "AV-1", recordedByAdminId: admin });
+  await assert.rejects(
+    recordAveniaVerdict({ orgId: org, decision: "rejected", aveniaReference: "AV-2", recordedByAdminId: admin }),
+    /admission_already_recorded/,
+  );
+  // The org stays approved/active — the second relay never overwrote a decided verdict.
+  const { rows } = await pool.query("select state, admission_state from orgs where id = $1", [org]);
+  assert.equal(rows[0].admission_state, "approved");
+  assert.equal(rows[0].state, "active");
+});
+
 test("guard: rejects relay for a non-avenia jurisdiction", async () => {
   // Temp non-avenia jurisdiction (e.g. a hypothetical lince-admitted market).
   await pool.query(
