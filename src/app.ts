@@ -43,6 +43,7 @@ import { requireStepUp } from "./modules/access/requireStepUp.js";
 import { requireMfa } from "./modules/access/requireMfa.js";
 import { rateLimit } from "./modules/ratelimit/middleware.js";
 import { receiveWebhook } from "./modules/webhooks/inbox.js";
+import { aveniaWebhookPublicKey } from "./modules/webhooks/aveniaKey.js";
 import { drainWebhooks } from "./modules/webhooks/processor.js";
 import { drainOutboxOnce } from "./modules/notifications/outbox.js";
 import { recordAveniaVerdict } from "./modules/onboarding/admission.service.js";
@@ -89,10 +90,11 @@ function requireClerkUserId(req: Request, res: Response): string | null {
 }
 
 // Per-provider inbound webhook secrets, resolved once from env for the verify registry.
+// Avenia's is a published public key, fetched+cached from the API (RSA-PSS over raw body).
 const webhookVerifierConfig = {
   clerkSecret: env.clerk.webhookSigningSecret,
   resendSecret: env.webhooks.resendSecret,
-  aveniaSecret: env.webhooks.aveniaSecret,
+  aveniaPublicKey: aveniaWebhookPublicKey,
 };
 
 // Shared webhook route body: build the receipt input from the request and delegate to the
@@ -100,18 +102,21 @@ const webhookVerifierConfig = {
 // (503 unconfigured / 400 bad sig / 202 {received:true}); linking now happens in the drain's
 // clerkHandler. External id prefers svix-id (clerk/resend) then x-event-id / body.id.
 async function handleWebhook(req: Request, res: Response, provider: string): Promise<void> {
-  const body = (req.body ?? {}) as { id?: unknown; type?: unknown };
-  const externalId = String(req.header("svix-id") ?? req.header("x-event-id") ?? body.id ?? randomUUID());
+  const body = (req.body ?? {}) as { id?: unknown; type?: unknown; eventId?: unknown; eventType?: unknown };
+  const externalId = String(
+    req.header("svix-id") ?? req.header("x-event-id") ?? body.id ?? body.eventId ?? randomUUID(),
+  );
   const outcome = await receiveWebhook({
     provider,
     externalId,
-    eventType: String(body.type ?? "unknown"),
+    eventType: String(body.type ?? body.eventType ?? "unknown"),
     rawBody: (req as unknown as { rawBody?: Buffer }).rawBody?.toString("utf8") ?? "",
     payload: req.body ?? {},
     headers: {
       "svix-id": req.header("svix-id"),
       "svix-timestamp": req.header("svix-timestamp"),
       "svix-signature": req.header("svix-signature"),
+      signature: req.header("signature"), // Avenia: base64 RSA-PSS over the raw body
     },
     config: webhookVerifierConfig,
     clientIp: req.ip,

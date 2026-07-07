@@ -60,10 +60,10 @@ export const env = {
     webhookMaxBytes: optional("WEBHOOK_MAX_BYTES") ?? "1mb",
   },
   // Inbound webhook signing secrets (B3). Clerk lives under clerk.webhookSigningSecret;
-  // resend is Svix-signed; avenia's inbound scheme is unconfirmed (verifier stays a stub).
+  // resend is Svix-signed; avenia verifies against its published public key (no env secret —
+  // see modules/webhooks/aveniaKey.ts).
   webhooks: {
     resendSecret: optional("RESEND_WEBHOOK_SECRET"),
-    aveniaSecret: optional("AVENIA_WEBHOOK_SECRET"),
   },
   // Shared secret for server-to-server /admin/* calls from the admin app (which
   // authenticates staff via its own, separate Clerk instance).

@@ -95,10 +95,12 @@ test("replay resets a dead row so the drain re-picks and processes it", async ()
 });
 
 test("receiveWebhook dedupes on (provider, external_event_id)", async () => {
+  // didit = still store-only (scheme unconfirmed); avenia is signature-verified since the
+  // PSS scheme landed, so it no longer works as the store-only example here.
   const input = {
-    provider: "avenia",
+    provider: "didit",
     externalId: "dup-1",
-    eventType: "ticket.updated",
+    eventType: "verification.updated",
     rawBody: "{}",
     payload: { id: "dup-1" },
     headers: {},
@@ -107,7 +109,7 @@ test("receiveWebhook dedupes on (provider, external_event_id)", async () => {
   assert.equal((await receiveWebhook(input)).status, 202);
   assert.equal((await receiveWebhook(input)).status, 202);
   const { rowCount } = await pool.query(
-    "select 1 from webhook_events where provider_code = 'avenia' and external_event_id = 'dup-1'",
+    "select 1 from webhook_events where provider_code = 'didit' and external_event_id = 'dup-1'",
   );
   assert.equal(rowCount, 1);
 });

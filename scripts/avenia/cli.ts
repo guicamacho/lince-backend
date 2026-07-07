@@ -191,21 +191,45 @@ async function ticketCancel(): Promise<void> {
   show(body);
 }
 
+async function webhooks(): Promise<void> {
+  const { body } = await signedFetch("GET", "/v2/notifications/webhooks/");
+  show(body);
+}
+
+async function webhookRegister(): Promise<void> {
+  const url = flag("url") ?? fail("--url required (public HTTPS endpoint, e.g. https://…/webhooks/avenia)");
+  if (flags.get("execute") !== true) fail("registers a webhook URL (max 3 per account) — re-run with --execute");
+  const subs = flag("subs", "TICKET")!.split(",");
+  const { body } = await signedFetch("POST", "/v2/notifications/webhooks/", { webhookUrl: url, subscriptions: subs });
+  show(body);
+}
+
+async function webhookDelete(): Promise<void> {
+  const id = flag("id") ?? fail("--id required");
+  if (flags.get("execute") !== true) fail("deletes a webhook registration — re-run with --execute");
+  const { body } = await signedFetch("DELETE", `/v2/notifications/webhooks/${id}`);
+  show(body);
+}
+
 const COMMANDS: Record<string, () => Promise<void>> = {
-  selfcheck, probe, quote, tickets, subaccounts,
+  selfcheck, probe, quote, tickets, subaccounts, webhooks,
   "subaccount-create": subaccountCreate,
   "ticket-create": ticketCreate,
   "ticket-cancel": ticketCancel,
+  "webhook-register": webhookRegister,
+  "webhook-delete": webhookDelete,
 };
 
 const run = COMMANDS[cmd ?? ""];
 if (!run) {
   console.log(`Avenia sandbox CLI — main/master account (omit --sub) or --sub <subAccountId>
 
-read-only:  selfcheck | probe | quote [--in BRL --inMethod PIX --out BRLA --outMethod INTERNAL --amount 100] | tickets [--id <id>] | subaccounts
+read-only:  selfcheck | probe | quote [--in BRL --inMethod PIX --out BRLA --outMethod INTERNAL --amount 100] | tickets [--id <id>] | subaccounts | webhooks
 durable:    subaccount-create --name "Empresa LTDA" [--type COMPANY] --execute   (PERMANENT — no delete)
             ticket-create [--amount 100] --execute                               (sandbox auto-pays ≤ R$1,000)
             ticket-cancel --id <id> --execute
+            webhook-register --url https://host/webhooks/avenia [--subs TICKET] --execute
+            webhook-delete --id <id> --execute
 
 env: AVENIA_API_KEY + (AVENIA_SIGNING_KEY_FILE | AVENIA_SIGNING_PRIVATE_KEY) [+ AVENIA_BASE_URL]
 Start with: selfcheck (offline), then probe. Docs: https://integration-guide.avenia.io`);
