@@ -2,7 +2,7 @@
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { pool } from "../src/db/pool.js";
-import { ensureAveniaSubaccount } from "../src/modules/onboarding/aveniaProvisioning.js";
+import { ensureAveniaSubaccount, depositDetailsForOrg } from "../src/modules/onboarding/aveniaProvisioning.js";
 import { resetDb, createOrg } from "./helpers.js";
 
 beforeEach(resetDb);
@@ -62,4 +62,41 @@ test("unfilled claim held by another in-flight caller -> retryable 409", async (
   const orgId = await createOrg("pending_lince_approval");
   await pool.query("insert into avenia_accounts (org_id) values ($1)", [orgId]); // someone mid-flight
   await assert.rejects(() => ensureAveniaSubaccount(orgId, fakeClient()), /avenia_provisioning_in_progress/);
+});
+
+function fakeFullClient() {
+  const base = fakeClient();
+  return Object.assign(base, {
+    async getAccountInfo(subAccountId?: string) {
+      return {
+        pixKey: `pix_for_${subAccountId}`,
+        brCode: "00020126...",
+        wallets: [{ walletAddress: "0xabc", chain: "EVM" }],
+      };
+    },
+  });
+}
+
+test("depositDetailsForOrg returns trimmed details for a provisioned org", async () => {
+  const orgId = await createOrg("active");
+  const client = fakeFullClient();
+  await ensureAveniaSubaccount(orgId, client);
+  const details = await depositDetailsForOrg(orgId, client);
+  assert.equal(details.pixKey, "pix_for_sub_1");
+  assert.deepEqual(details.wallets, [{ chain: "EVM", address: "0xabc" }]);
+});
+
+test("depositDetailsForOrg lazily provisions an org approved before provisioning shipped", async () => {
+  const orgId = await createOrg("active");
+  const client = fakeFullClient();
+  const details = await depositDetailsForOrg(orgId, client);
+  assert.equal(client.calls, 1, "subaccount created on demand");
+  assert.equal(details.pixKey, "pix_for_sub_1");
+  const row = await pool.query("select subaccount_id from avenia_accounts where org_id = $1", [orgId]);
+  assert.equal(row.rows[0].subaccount_id, "sub_1");
+});
+
+test("depositDetailsForOrg without Avenia configured -> 503", async () => {
+  const orgId = await createOrg("active");
+  await assert.rejects(() => depositDetailsForOrg(orgId, null), /avenia_unavailable/);
 });

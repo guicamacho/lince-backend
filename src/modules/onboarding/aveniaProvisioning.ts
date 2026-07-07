@@ -13,7 +13,7 @@
  */
 import { pool } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
-import type { SubAccountCreator } from "../providers/avenia/avenia.client.js";
+import type { SubAccountCreator, AccountInfoReader } from "../providers/avenia/avenia.client.js";
 
 /** Idempotent: returns the org's subaccount id, creating it on Avenia if needed.
  *  Returns null when Avenia is not configured in this environment (keyless dev/tests). */
@@ -57,4 +57,38 @@ export async function ensureAveniaSubaccount(orgId: string, client: SubAccountCr
 
 async function releaseClaim(orgId: string): Promise<void> {
   await pool.query("delete from avenia_accounts where org_id = $1 and subaccount_id is null", [orgId]);
+}
+
+export interface DepositDetails {
+  pixKey: string | null;
+  brCode: string | null;
+  wallets: Array<{ chain: string; address: string }>;
+}
+
+/** Deposit details for an APPROVED org (the /app gate enforces active status).
+ *  Lazily provisions the subaccount for orgs approved before provisioning shipped.
+ *  NOTE: pre-KYB, Avenia returns the MASTER account's pixKey/brCode for a subaccount
+ *  (verified 2026-07-07) — per-customer deposit routing uses per-ticket brCodes until
+ *  subaccount KYB L1 lands; this endpoint surfaces what Avenia reports for the org. */
+export async function depositDetailsForOrg(
+  orgId: string,
+  client: (SubAccountCreator & AccountInfoReader) | null,
+): Promise<DepositDetails> {
+  if (!client) throw new HttpError("avenia_unavailable", 503);
+  const { rows } = await pool.query<{ subaccount_id: string | null }>(
+    "select subaccount_id from avenia_accounts where org_id = $1",
+    [orgId],
+  );
+  const sub = rows[0]?.subaccount_id ?? (await ensureAveniaSubaccount(orgId, client));
+  let info;
+  try {
+    info = await client.getAccountInfo(sub ?? undefined);
+  } catch {
+    throw new HttpError("avenia_unavailable", 502);
+  }
+  return {
+    pixKey: info.pixKey ?? null,
+    brCode: info.brCode ?? null,
+    wallets: (info.wallets ?? []).map((w) => ({ chain: w.chain, address: w.walletAddress })),
+  };
 }

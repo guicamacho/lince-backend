@@ -19,8 +19,29 @@ export interface SubAccountCreator {
   createSubAccount(name: string): Promise<{ id: string }>;
 }
 
-export class AveniaClient implements RailProvider, SubAccountCreator {
+/** Deposit-relevant slice of GET /v2/account/account-info. */
+export interface AveniaAccountInfo {
+  pixKey?: string;
+  brCode?: string;
+  wallets?: Array<{ walletAddress: string; chain: string }>;
+}
+export interface AccountInfoReader {
+  getAccountInfo(subAccountId?: string): Promise<AveniaAccountInfo>;
+}
+
+export class AveniaClient implements RailProvider, SubAccountCreator, AccountInfoReader {
   constructor(private readonly config: AveniaConfig) {}
+
+  /** Account info (wallets + PIX key/brCode). Scoped to a subaccount when given,
+   *  else the MAIN account. Read-only. */
+  async getAccountInfo(subAccountId?: string): Promise<AveniaAccountInfo> {
+    const requestUri = `/v2/account/account-info${subAccountId ? `?subAccountId=${encodeURIComponent(subAccountId)}` : ""}`;
+    const res = await fetch(`${this.config.baseUrl}${requestUri}`, {
+      headers: this.signedHeaders("GET", requestUri),
+    });
+    if (!res.ok) throw new Error(`avenia account-info ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    return (await res.json()) as AveniaAccountInfo;
+  }
 
   /** COMPANY subaccount on the MAIN account (Connectivity §1/§3) — one per customer org.
    *  Master-scoped: no subAccountId param. PERMANENT on Avenia (no delete). */

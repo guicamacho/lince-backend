@@ -56,6 +56,7 @@ export const ROUTE_CLASSMAP: Record<string, RouteClass> = {
   "POST /onboarding/cnpj-lookup": "cnpj_lookup",
   "GET /onboarding/state": "reads",
   "GET /app/me": "reads",
+  "GET /app/deposit-details": "reads",
   "GET /app/beneficiaries": "reads",
   "POST /app/beneficiaries": "beneficiary_write",
   "GET /app/notifications": "reads",

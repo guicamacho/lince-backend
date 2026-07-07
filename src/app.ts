@@ -37,7 +37,7 @@ import { setOrgAccess } from "./modules/access/access.service.js";
 import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
-import { ensureAveniaSubaccount } from "./modules/onboarding/aveniaProvisioning.js";
+import { ensureAveniaSubaccount, depositDetailsForOrg } from "./modules/onboarding/aveniaProvisioning.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { requireStepUp } from "./modules/access/requireStepUp.js";
 import { requireMfa } from "./modules/access/requireMfa.js";
@@ -206,6 +206,13 @@ app.use("/app", async (req: Request, res: Response, next: NextFunction) => {
 app.get("/app/me", rateLimit("reads"), async (_req: Request, res: Response) => {
   const { rows } = await pool.query("select id, razao_social, state from orgs where id = $1", [res.locals.orgId]);
   res.json(rows[0] ?? null);
+});
+
+// Avenia deposit details (PIX + wallets) — post-approval only (the /app gate = the admin
+// portal verdict). Avenia serves the data regardless of KYB status; pre-KYB the pixKey
+// may be the shared master key (see aveniaProvisioning.depositDetailsForOrg note).
+app.get("/app/deposit-details", rateLimit("reads"), async (_req: Request, res: Response) => {
+  res.json(await depositDetailsForOrg(res.locals.orgId, aveniaFromEnv()));
 });
 
 // Beneficiaries — travel-rule capture (AUSTRAC §4 / 255033346). The customer captures payee
