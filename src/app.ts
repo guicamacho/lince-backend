@@ -38,6 +38,7 @@ import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
 import { ensureAveniaSubaccount, depositDetailsForOrg } from "./modules/onboarding/aveniaProvisioning.js";
+import { createDeposit, listTransactionsForOrg } from "./modules/money/deposits.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { requireStepUp } from "./modules/access/requireStepUp.js";
 import { requireMfa } from "./modules/access/requireMfa.js";
@@ -220,6 +221,26 @@ app.get("/app/me", rateLimit("reads"), async (_req: Request, res: Response) => {
 // may be the shared master key (see aveniaProvisioning.depositDetailsForOrg note).
 app.get("/app/deposit-details", rateLimit("reads"), async (_req: Request, res: Response) => {
   res.json(await depositDetailsForOrg(res.locals.orgId, aveniaFromEnv()));
+});
+
+// Create a PIX deposit: amount -> subaccount-scoped quote+ticket -> brCode the customer pays.
+// Idempotent on (org, idemKey) with payload binding (PRD-07 §2 p5). First real money producer.
+app.post("/app/deposits", rateLimit("beneficiary_write"), async (req: Request, res: Response) => {
+  const { userId } = getAuth(req);
+  const person = await pool.query<{ id: string }>("select id from people where clerk_user_id = $1", [userId]);
+  const { amountBrl, idemKey } = (req.body ?? {}) as { amountBrl?: string; idemKey?: string };
+  if (!amountBrl || !idemKey) {
+    res.status(422).json({ error: "amountBrl_and_idemKey_required" });
+    return;
+  }
+  res.status(201).json(
+    await createDeposit(res.locals.orgId, person.rows[0]?.id ?? null, { amountBrl, idemKey }, aveniaFromEnv()),
+  );
+});
+
+// Transaction list — the frozen contract the F3 Transações UI was built against.
+app.get("/app/transactions", rateLimit("reads"), async (_req: Request, res: Response) => {
+  res.json({ transactions: await listTransactionsForOrg(res.locals.orgId) });
 });
 
 // Beneficiaries — travel-rule capture (AUSTRAC §4 / 255033346). The customer captures payee

@@ -12,7 +12,10 @@ export interface Quote {
   appliedFees: Array<{ label: string; amount: bigint; currency: Currency; rebatable: boolean }>;
 }
 
-export type TicketState = "UNPAID" | "PROCESSING" | "PAID" | "FAILED" | "PARTIAL_FAILED";
+// Observed live 2026-07-07 + integration guide: ON-HOLD sits between PROCESSING and PAID;
+// CANCELED comes from PATCH /tickets/{id}/cancel (UNPAID only). Wire format uses hyphens
+// (PARTIAL-FAILED, ON-HOLD) — normalize via ticketState.normalizeTicketStatus.
+export type TicketState = "UNPAID" | "PROCESSING" | "ON_HOLD" | "PAID" | "FAILED" | "PARTIAL_FAILED" | "CANCELED";
 
 export interface Ticket {
   ticketId: string;

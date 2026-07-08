@@ -12,6 +12,8 @@
 import type pg from "pg";
 import { pool, withTransaction } from "../../db/pool.js";
 import { linkClerkUserFromEvent, type ClerkUserEvent } from "../identity/clerkSync.js";
+import { ticketTransitionAllowed, normalizeTicketStatus } from "./ticketState.js";
+import type { TicketState } from "../providers/provider.types.js";
 
 export interface WebhookEventRow {
   id: string;
@@ -39,21 +41,52 @@ const clerkHandler: WebhookHandler = async (_client, row) => {
   await linkClerkUserFromEvent(row.payload as ClerkUserEvent);
 };
 
+/** Avenia ticket status -> Lince org_transactions.state (deposit lifecycle). */
+const TICKET_TO_TX_STATE: Record<string, string> = {
+  UNPAID: "funding",
+  PROCESSING: "executing",
+  ON_HOLD: "on_hold",
+  PAID: "settled",
+  FAILED: "failed",
+  PARTIAL_FAILED: "failed",
+  CANCELED: "cancelled",
+};
+
 /**
- * Avenia ticket events. DORMANT: no money-out route creates org_transactions rows yet (B4).
- * The monotonic decision lives in ticketState.ts (built + unit-tested). Here we only take the
- * row lock and stop — B4 wires the state CAS + ledger postings atomically in THIS transaction.
- * ponytail: writing org_transactions.state without B4's postings would break ledger invariants,
- * so this is a lock-discipline seam, not a settle path. Wire the CAS when the producer lands.
+ * Avenia TICKET events (envelope observed live: { event: { id, data: { type, ticket } } }).
+ * Row lock (FOR UPDATE) + the pure monotonic guard (ticketState.ts) = idempotent,
+ * out-of-order-safe state application. Tickets with no matching row (master/faucet or
+ * pre-producer tickets) are ignored on purpose.
+ * ponytail: ledger postings on PAID belong to the postings WP (needs per-org ledger
+ * accounts); until then settled state lives on org_transactions only.
  */
 const aveniaHandler: WebhookHandler = async (client, row) => {
-  const vendorRef = (row.payload as { ticketId?: string } | null)?.ticketId;
-  if (!vendorRef) return;
-  await client.query(
-    `select id, state from org_transactions where provider_code = $1 and vendor_ref = $2 for update`,
-    [row.provider_code, vendorRef],
+  const data = (row.payload as { event?: { data?: { ticket?: { id?: string; status?: string } } } } | null)
+    ?.event?.data;
+  const ticket = data?.ticket;
+  if (!ticket?.id || !ticket.status) return; // not a ticket envelope (e.g. KYC events later)
+  const { rows } = await client.query<{ id: string; quote: { ticketStatus?: string } | null }>(
+    `select id, quote from org_transactions where provider_code = $1 and vendor_ref = $2 for update`,
+    [row.provider_code, ticket.id],
   );
-  // no live producer -> nothing to apply; B4 runs ticketTransitionAllowed + CAS + postings here.
+  const tx = rows[0];
+  if (!tx) return;
+  const incoming = normalizeTicketStatus(ticket.status);
+  const current = (tx.quote?.ticketStatus ?? null) as TicketState | null;
+  const decision = ticketTransitionAllowed(current, incoming);
+  if (decision === "reject") {
+    console.warn("avenia.ticket_state_unknown", JSON.stringify({ vendorRef: ticket.id, incoming }));
+    return; // don't poison the queue over an unknown state; greppable for the log alarm
+  }
+  if (decision === "ignore") return;
+  await client.query(
+    `update org_transactions
+        set state = $2,
+            quote = coalesce(quote, '{}'::jsonb) || jsonb_build_object('ticketStatus', $3::text),
+            updated_at = now()
+      where id = $1`,
+    [tx.id, TICKET_TO_TX_STATE[incoming] ?? "executing", incoming],
+  );
 };
 
 const DEFAULT_HANDLERS: Record<string, WebhookHandler> = {

@@ -15,15 +15,23 @@ import type { TicketState } from "../providers/provider.types.js";
 
 export type TicketTransition = "apply" | "ignore" | "reject";
 
-/** Forward-only rank. The three terminals share rank 2 — none regresses to another. */
+/** Forward-only rank. Terminals share rank 2 — none regresses to another. ON_HOLD shares
+ *  rank 1 with PROCESSING (Avenia can move between them; both non-terminal). */
 const TICKET_RANK: Record<TicketState, number> = {
   UNPAID: 0,
   PROCESSING: 1,
+  ON_HOLD: 1,
   PAID: 2,
   FAILED: 2,
   PARTIAL_FAILED: 2,
+  CANCELED: 2,
 };
 const TERMINAL_RANK = 2;
+
+/** Wire format uses hyphens (ON-HOLD, PARTIAL-FAILED); ranks use underscores. */
+export function normalizeTicketStatus(wire: string): string {
+  return wire.toUpperCase().replaceAll("-", "_");
+}
 
 /**
  * Decide how to treat an incoming ticket state given the current one.

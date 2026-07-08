@@ -29,8 +29,79 @@ export interface AccountInfoReader {
   getAccountInfo(subAccountId?: string): Promise<AveniaAccountInfo>;
 }
 
-export class AveniaClient implements RailProvider, SubAccountCreator, AccountInfoReader {
+/** Raw quote fields the deposit flow snapshots (amounts stay decimal STRINGS off the wire;
+ *  the money module converts to bigint minor units at the edge). */
+export interface AveniaDepositResult {
+  ticketId: string;
+  brCode: string;
+  expiration: string;
+  quote: {
+    inputCurrency: string;
+    inputAmount: string;
+    outputCurrency: string;
+    outputAmount: string;
+    basePrice: string;
+    pairName: string;
+    appliedFees: Array<{ type: string; amount: string; currency: string; rebatable: boolean; description?: string }>;
+  };
+}
+
+export interface DepositRail {
+  createPixDeposit(input: { subAccountId: string; amountBrl: string }): Promise<AveniaDepositResult>;
+}
+
+export class AveniaClient implements RailProvider, SubAccountCreator, AccountInfoReader, DepositRail {
   constructor(private readonly config: AveniaConfig) {}
+
+  /** PIX-in deposit for a subaccount: quote + ticket inside the 15s quoteToken window.
+   *  Returns the brCode the customer pays; nothing moves until it's paid. The nil-UUID
+   *  beneficiaryWalletId means "this subaccount" — resolved from subAccountId at quote time. */
+  async createPixDeposit(input: { subAccountId: string; amountBrl: string }): Promise<AveniaDepositResult> {
+    const q = new URLSearchParams({
+      inputCurrency: "BRL",
+      inputPaymentMethod: "PIX",
+      outputCurrency: "BRLA",
+      outputPaymentMethod: "INTERNAL",
+      inputAmount: input.amountBrl,
+      inputThirdParty: "false",
+      outputThirdParty: "false",
+      blockchainSendMethod: "PERMIT",
+      subAccountId: input.subAccountId,
+    });
+    const quoteUri = `/v2/account/quote/fixed-rate?${q}`;
+    const quoteRes = await fetch(`${this.config.baseUrl}${quoteUri}`, { headers: this.signedHeaders("GET", quoteUri) });
+    if (!quoteRes.ok) throw new Error(`avenia quote ${quoteRes.status}: ${(await quoteRes.text()).slice(0, 200)}`);
+    const quote = (await quoteRes.json()) as AveniaDepositResult["quote"] & { quoteToken?: string };
+    if (!quote.quoteToken) throw new Error("avenia quote: no quoteToken");
+
+    const ticketUri = `/v2/account/tickets/?subAccountId=${encodeURIComponent(input.subAccountId)}`;
+    const body = JSON.stringify({
+      quoteToken: quote.quoteToken,
+      ticketBlockchainOutput: { beneficiaryWalletId: "00000000-0000-0000-0000-000000000000" },
+    });
+    const ticketRes = await fetch(`${this.config.baseUrl}${ticketUri}`, {
+      method: "POST",
+      headers: this.signedHeaders("POST", ticketUri, body),
+      body,
+    });
+    if (!ticketRes.ok) throw new Error(`avenia ticket ${ticketRes.status}: ${(await ticketRes.text()).slice(0, 200)}`);
+    const ticket = (await ticketRes.json()) as { id?: string; brCode?: string; expiration?: string };
+    if (!ticket.id || !ticket.brCode) throw new Error("avenia ticket: missing id/brCode");
+    return {
+      ticketId: ticket.id,
+      brCode: ticket.brCode,
+      expiration: ticket.expiration ?? "",
+      quote: {
+        inputCurrency: quote.inputCurrency,
+        inputAmount: quote.inputAmount,
+        outputCurrency: quote.outputCurrency,
+        outputAmount: quote.outputAmount,
+        basePrice: quote.basePrice,
+        pairName: quote.pairName,
+        appliedFees: quote.appliedFees ?? [],
+      },
+    };
+  }
 
   /** Account info (wallets + PIX key/brCode). Scoped to a subaccount when given,
    *  else the MAIN account. Read-only. */

@@ -2,10 +2,11 @@
  * Money is ALWAYS signed bigint minor units. Never floats, never Number for amounts.
  * Per-currency decimal places. (BRLA is held; "R$" is presentation-only — same 2 dp as BRL.)
  */
-export type Currency = "BRL" | "USD" | "EUR" | "USDC" | "USDT";
+export type Currency = "BRL" | "BRLA" | "USD" | "EUR" | "USDC" | "USDT";
 
 const DECIMALS: Record<Currency, number> = {
   BRL: 2,
+  BRLA: 2, // Avenia's BRL stablecoin — displayed as R$, same 2 dp
   USD: 2,
   EUR: 2,
   USDC: 6,
