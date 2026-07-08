@@ -17,11 +17,12 @@
  * until then settled state lives on org_transactions only.
  */
 import { createHash } from "node:crypto";
-import { pool } from "../../db/pool.js";
+import { pool, withTransaction } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
 import { toMinor, type Currency } from "../../money/money.js";
 import { ensureAveniaSubaccount } from "../onboarding/aveniaProvisioning.js";
-import type { DepositRail, SubAccountCreator, AccountInfoReader } from "../providers/avenia/avenia.client.js";
+import { applyTicketStatus } from "./ticketApply.js";
+import type { DepositRail, SubAccountCreator, AccountInfoReader, TicketReader } from "../providers/avenia/avenia.client.js";
 
 export type DepositClient = DepositRail & SubAccountCreator & AccountInfoReader;
 
@@ -143,6 +144,47 @@ export async function createDeposit(
      JSON.stringify({ txId, vendorRef: result.ticketId, amountBrl: input.amountBrl })],
   );
   return receiptFrom(upd.rows[0]!);
+}
+
+/**
+ * Poll backstop for in-flight deposits (G19 gap tolerance): tickets whose webhooks were
+ * missed — or never delivered at all, as in local dev where the webhook registration
+ * points at the deployed endpoint — get their status pulled and applied through the SAME
+ * monotonic guard the webhook handler uses. Only rows quiet for `quietSeconds` are polled,
+ * so webhooks always win when they're flowing; per-run cap keeps Avenia calls bounded
+ * (rate limits unconfirmed — Avenia question #10).
+ */
+export async function reconcileInFlightDeposits(rail: TicketReader, quietSeconds = 45, limit = 10): Promise<number> {
+  const { rows } = await pool.query<{ id: string; vendor_ref: string; subaccount_id: string | null }>(
+    `select t.id, t.vendor_ref, a.subaccount_id
+       from org_transactions t
+       left join avenia_accounts a on a.org_id = t.org_id
+      where t.provider_code = 'avenia' and t.vendor_ref is not null
+        and t.state in ('created', 'funding', 'executing', 'on_hold')
+        and t.updated_at < now() - make_interval(secs => $1)
+      order by t.updated_at asc
+      limit $2`,
+    [quietSeconds, limit],
+  );
+  let applied = 0;
+  for (const r of rows) {
+    if (!r.subaccount_id) continue;
+    let status: string;
+    try {
+      status = (await rail.getTicket({ subAccountId: r.subaccount_id, ticketId: r.vendor_ref })).status;
+    } catch {
+      continue; // transient Avenia error — next pass retries
+    }
+    await withTransaction(async (c) => {
+      const locked = await c.query<{ id: string; quote: { ticketStatus?: string } | null }>(
+        `select id, quote from org_transactions where id = $1 for update`,
+        [r.id],
+      );
+      if (!locked.rows[0]) return;
+      if ((await applyTicketStatus(c, locked.rows[0], status)) === "apply") applied++;
+    });
+  }
+  return applied;
 }
 
 /** The frozen GET /app/transactions contract the F3 customer UI was built against. */

@@ -38,7 +38,7 @@ import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
 import { ensureAveniaSubaccount, depositDetailsForOrg } from "./modules/onboarding/aveniaProvisioning.js";
-import { createDeposit, listTransactionsForOrg } from "./modules/money/deposits.js";
+import { createDeposit, listTransactionsForOrg, reconcileInFlightDeposits } from "./modules/money/deposits.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { requireStepUp } from "./modules/access/requireStepUp.js";
 import { requireMfa } from "./modules/access/requireMfa.js";
@@ -529,13 +529,20 @@ if (process.env.NODE_ENV !== "test") {
   // Single-flight: skip a tick if the previous one is still running, so a slow DB can't
   // pile up overlapping drains and exhaust the connection pool.
   let draining = false;
+  let tick = 0;
   setInterval(() => {
     if (draining) return;
     draining = true;
+    tick++;
     void (async () => {
       try {
         await drainWebhooks();
         await drainOutboxOnce(notifyConfig);
+        // Deposit reconcile backstop every ~12th tick (~60s at the 5s drain cadence):
+        // webhooks win when flowing; this catches missed deliveries — and is the ONLY
+        // settle path in local dev, where webhooks point at the deployed endpoint.
+        const avenia = aveniaFromEnv();
+        if (avenia && tick % 12 === 0) await reconcileInFlightDeposits(avenia);
       } catch (err) {
         console.warn("drain.tick_failed", err instanceof Error ? err.message : String(err));
       } finally {

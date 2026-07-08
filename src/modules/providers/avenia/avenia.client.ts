@@ -50,8 +50,23 @@ export interface DepositRail {
   createPixDeposit(input: { subAccountId: string; amountBrl: string }): Promise<AveniaDepositResult>;
 }
 
-export class AveniaClient implements RailProvider, SubAccountCreator, AccountInfoReader, DepositRail {
+export interface TicketReader {
+  getTicket(input: { subAccountId: string; ticketId: string }): Promise<{ id: string; status: string }>;
+}
+
+export class AveniaClient implements RailProvider, SubAccountCreator, AccountInfoReader, DepositRail, TicketReader {
   constructor(private readonly config: AveniaConfig) {}
+
+  /** One ticket's current status — the reconciler's poll (subAccountId must match the
+   *  quote's scoping or Avenia 404s). */
+  async getTicket(input: { subAccountId: string; ticketId: string }): Promise<{ id: string; status: string }> {
+    const requestUri = `/v2/account/tickets/${encodeURIComponent(input.ticketId)}?subAccountId=${encodeURIComponent(input.subAccountId)}`;
+    const res = await fetch(`${this.config.baseUrl}${requestUri}`, { headers: this.signedHeaders("GET", requestUri) });
+    if (!res.ok) throw new Error(`avenia ticket get ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const out = (await res.json()) as { ticket?: { id?: string; status?: string } };
+    if (!out.ticket?.id || !out.ticket.status) throw new Error("avenia ticket get: missing id/status");
+    return { id: out.ticket.id, status: out.ticket.status };
+  }
 
   /** PIX-in deposit for a subaccount: quote + ticket inside the 15s quoteToken window.
    *  Returns the brCode the customer pays; nothing moves until it's paid. The nil-UUID

@@ -3,7 +3,7 @@ import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { pool } from "../src/db/pool.js";
-import { createDeposit, type DepositClient } from "../src/modules/money/deposits.js";
+import { createDeposit, reconcileInFlightDeposits, type DepositClient } from "../src/modules/money/deposits.js";
 import { drainWebhooks } from "../src/modules/webhooks/processor.js";
 import { resetDb, createOrg } from "./helpers.js";
 
@@ -120,4 +120,19 @@ test("events for unknown tickets (master/faucet) are ignored without error", asy
   await drainWebhooks();
   const { rows } = await pool.query("select status from webhook_events");
   assert.equal(rows[0].status, "processed");
+});
+
+test("reconciler settles a quiet in-flight deposit when webhooks never arrive", async () => {
+  const orgId = await createOrg("active");
+  const receipt = await createDeposit(orgId, null, { amountBrl: "100", idemKey: randomUUID() }, fakeClient());
+  // age the row past the quiet window (webhooks would normally win inside it)
+  await pool.query("update org_transactions set updated_at = now() - interval '10 minutes' where id = $1", [receipt.id]);
+  const rail = { async getTicket() { return { id: "tkt_1", status: "PAID" }; } };
+  const applied = await reconcileInFlightDeposits(rail, 45, 10);
+  assert.equal(applied, 1);
+  const { rows } = await pool.query("select state, quote->>'ticketStatus' as ts from org_transactions where id = $1", [receipt.id]);
+  assert.equal(rows[0].state, "settled");
+  assert.equal(rows[0].ts, "PAID");
+  // second pass: nothing left in flight
+  assert.equal(await reconcileInFlightDeposits(rail, 45, 10), 0);
 });
