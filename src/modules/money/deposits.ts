@@ -21,7 +21,7 @@ import { pool, withTransaction } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
 import { toMinor, type Currency } from "../../money/money.js";
 import { ensureAveniaSubaccount } from "../onboarding/aveniaProvisioning.js";
-import { applyTicketStatus } from "./ticketApply.js";
+import { applyTicketStatus, APPLY_ROW_COLUMNS, type ApplyRow } from "./ticketApply.js";
 import type { DepositRail, SubAccountCreator, AccountInfoReader, TicketReader } from "../providers/avenia/avenia.client.js";
 
 export type DepositClient = DepositRail & SubAccountCreator & AccountInfoReader;
@@ -176,8 +176,8 @@ export async function reconcileInFlightDeposits(rail: TicketReader, quietSeconds
       continue; // transient Avenia error — next pass retries
     }
     await withTransaction(async (c) => {
-      const locked = await c.query<{ id: string; quote: { ticketStatus?: string } | null }>(
-        `select id, quote from org_transactions where id = $1 for update`,
+      const locked = await c.query<ApplyRow>(
+        `select ${APPLY_ROW_COLUMNS} from org_transactions where id = $1 for update`,
         [r.id],
       );
       if (!locked.rows[0]) return;

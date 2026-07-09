@@ -105,6 +105,32 @@ test("webhook TICKET events drive state forward, idempotently and monotonically"
   assert.equal(row.rows[0].state, "settled", "terminal state never regresses");
 });
 
+test("settle writes balanced ledger postings from ticket actuals — exactly once", async () => {
+  const { balancesForOrg } = await import("../src/modules/ledger/ledger.service.js");
+  const orgId = await createOrg("active");
+  const receipt = await createDeposit(orgId, null, { amountBrl: "100", idemKey: randomUUID() }, fakeClient());
+
+  await insertAveniaEvent("tkt_1", "PAID");
+  await drainWebhooks();
+  // customer sees +99.80 BRLA (net of the 0.20 In Fee), from the ticket's actual outputAmount
+  assert.deepEqual(await balancesForOrg(orgId), { BRLA: 9980 });
+  const postings = await pool.query(
+    `select p.amount::text, a.key from ledger_postings p join ledger_accounts a on a.id = p.account_id
+      join ledger_transactions t on t.id = p.ledger_tx_id where t.org_transaction_id = $1 order by p.amount desc`,
+    [receipt.id],
+  );
+  assert.equal(postings.rowCount, 2);
+  assert.equal(postings.rows[0].amount, "9980"); // debit avenia custody
+  assert.equal(postings.rows[0].key, "avenia:custody:BRLA");
+  assert.equal(postings.rows[1].amount, "-9980"); // credit org liability
+  // PAID replay must NOT double-post
+  await insertAveniaEvent("tkt_1", "PAID");
+  await drainWebhooks();
+  assert.deepEqual(await balancesForOrg(orgId), { BRLA: 9980 });
+  const again = await pool.query("select count(*)::int as n from ledger_postings");
+  assert.equal(again.rows[0].n, 2, "replay posts nothing");
+});
+
 test("hyphenated wire statuses normalize (PARTIAL-FAILED -> failed)", async () => {
   const orgId = await createOrg("active");
   const receipt = await createDeposit(orgId, null, { amountBrl: "100", idemKey: randomUUID() }, fakeClient());

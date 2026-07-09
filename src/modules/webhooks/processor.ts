@@ -12,7 +12,7 @@
 import type pg from "pg";
 import { pool, withTransaction } from "../../db/pool.js";
 import { linkClerkUserFromEvent, type ClerkUserEvent } from "../identity/clerkSync.js";
-import { applyTicketStatus } from "../money/ticketApply.js";
+import { applyTicketStatus, APPLY_ROW_COLUMNS, type ApplyRow } from "../money/ticketApply.js";
 
 export interface WebhookEventRow {
   id: string;
@@ -53,8 +53,8 @@ const aveniaHandler: WebhookHandler = async (client, row) => {
     ?.event?.data;
   const ticket = data?.ticket;
   if (!ticket?.id || !ticket.status) return; // not a ticket envelope (e.g. KYC events later)
-  const { rows } = await client.query<{ id: string; quote: { ticketStatus?: string } | null }>(
-    `select id, quote from org_transactions where provider_code = $1 and vendor_ref = $2 for update`,
+  const { rows } = await client.query<ApplyRow>(
+    `select ${APPLY_ROW_COLUMNS} from org_transactions where provider_code = $1 and vendor_ref = $2 for update`,
     [row.provider_code, ticket.id],
   );
   const tx = rows[0];

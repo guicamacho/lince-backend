@@ -39,6 +39,7 @@ import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
 import { ensureAveniaSubaccount, depositDetailsForOrg } from "./modules/onboarding/aveniaProvisioning.js";
 import { createDeposit, listTransactionsForOrg, reconcileInFlightDeposits } from "./modules/money/deposits.js";
+import { balancesForOrg } from "./modules/ledger/ledger.service.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { requireStepUp } from "./modules/access/requireStepUp.js";
 import { requireMfa } from "./modules/access/requireMfa.js";
@@ -241,6 +242,11 @@ app.post("/app/deposits", rateLimit("beneficiary_write"), async (req: Request, r
 // Transaction list — the frozen contract the F3 Transações UI was built against.
 app.get("/app/transactions", rateLimit("reads"), async (_req: Request, res: Response) => {
   res.json({ transactions: await listTransactionsForOrg(res.locals.orgId) });
+});
+
+// Ledger balances (minor units per currency) — settled money only, straight from postings.
+app.get("/app/balances", rateLimit("reads"), async (_req: Request, res: Response) => {
+  res.json({ balances: await balancesForOrg(res.locals.orgId) });
 });
 
 // Beneficiaries — travel-rule capture (AUSTRAC §4 / 255033346). The customer captures payee
