@@ -38,7 +38,8 @@ export function toMinor(amount: string, currency: Currency): bigint {
 export function vendorMinor(amount: string, currency: Currency): bigint {
   // The currency is ALSO vendor-supplied (fee rows arrive as free strings cast to Currency):
   // an unmapped label must degrade like a bad amount does, never throw. 2 dp = the map's mode.
-  const dp = DECIMALS[currency] ?? 2;
+  // hasOwn, not ??: a prototype-key label ("toString") makes the bare lookup return a function.
+  const dp = Object.hasOwn(DECIMALS, currency) ? DECIMALS[currency] : 2;
   const m = /^(-?)(\d+)(?:\.(\d+))?$/.exec(String(amount ?? "").trim());
   if (!m) return 0n;
   const sign = m[1];
