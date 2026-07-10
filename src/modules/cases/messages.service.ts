@@ -46,12 +46,21 @@ export interface PostAdminMessageInput {
  * invisible to the customer. That is the core guardrail.
  */
 export async function postAdminCaseMessage(input: PostAdminMessageInput): Promise<{ id: string }> {
+  return withTransaction((client) => postAdminCaseMessageOn(client, input));
+}
+
+/** Client-scoped variant — posts inside the CALLER's transaction so a composite action
+ *  (e.g. raise-RFI: state change + case + message) commits atomically. Same wall (L1-L3). */
+export async function postAdminCaseMessageOn(
+  client: import("pg").PoolClient,
+  input: PostAdminMessageInput,
+): Promise<{ id: string }> {
   if (!UUID_RE.test(input.caseId)) throw new HttpError("case_not_found", 404);
   const body = String(input.body ?? "").trim();
   if (!body) throw new HttpError("empty_body", 400);
   const requested = input.customerVisible === true;
 
-  return withTransaction(async (client) => {
+  {
     const { rows } = await client.query<{ type: string; org_id: string | null }>(
       `select type, org_id from cases where id = $1 for update`,
       [input.caseId],
@@ -94,5 +103,5 @@ export async function postAdminCaseMessage(input: PostAdminMessageInput): Promis
       [c.org_id, input.authorAdminId, JSON.stringify({ caseId: input.caseId, messageId, customerVisible: requested })],
     );
     return { id: messageId };
-  });
+  }
 }

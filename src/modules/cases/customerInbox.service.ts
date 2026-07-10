@@ -69,6 +69,19 @@ export async function listCustomerCasesForOrg(orgId: string) {
   return rows.map((r) => ({ ...r, status: customerStatus(r.status) }));
 }
 
+/** The org's open RFI thread, readable during onboarding (pre-active) — the ONE
+ *  correspondence type that must reach a non-active org (EDD info request relay).
+ *  Returns {case:null} when there's no open rfi_relay case. */
+export async function getOpenRfiThreadForOrg(orgId: string) {
+  const { rows } = await pool.query<{ id: string }>(
+    `select id from cases where org_id = $1 and type = 'rfi_relay' and status <> 'closed'
+      order by opened_at desc limit 1`,
+    [orgId],
+  );
+  if (!rows[0]) return { case: null, messages: [] as unknown[] };
+  return getCaseThreadForOrg(orgId, rows[0].id);
+}
+
 export async function getCaseThreadForOrg(orgId: string, caseId: string) {
   if (!UUID_RE.test(caseId)) throw new HttpError("case_not_found", 404);
   const { rows } = await pool.query(

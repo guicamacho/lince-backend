@@ -64,8 +64,10 @@ import {
   markNotificationRead,
   listCustomerCasesForOrg,
   getCaseThreadForOrg,
+  getOpenRfiThreadForOrg,
   postCustomerCaseReply,
 } from "./modules/cases/customerInbox.service.js";
+import { raiseRfi } from "./modules/onboarding/rfi.service.js";
 
 export const app = express();
 // Capture the raw body (needed to verify webhook signatures) while still parsing JSON.
@@ -169,6 +171,38 @@ app.post("/onboarding/mock-verify", rateLimit("signup_start"), async (req: Reque
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
   res.json(await advanceCallerOrg(uid, "vendor_pending"));
+});
+
+// RFI (EDD) correspondence, readable/repliable during onboarding — the ONE case type that
+// must reach a pre-active org. Caller org resolved from the Clerk user (any state); scoped
+// to the open rfi_relay thread only (not the full inbox, which stays active-gated).
+app.get("/onboarding/rfi", rateLimit("reads"), async (req: Request, res: Response) => {
+  const uid = requireClerkUserId(req, res);
+  if (!uid) return;
+  const org = await currentOrgForClerkUser(uid);
+  if (!org) {
+    res.status(404).json({ error: "no_org_for_user" });
+    return;
+  }
+  res.json(await getOpenRfiThreadForOrg(org.orgId));
+});
+
+app.post("/onboarding/rfi/reply", rateLimit("signup_start"), async (req: Request, res: Response) => {
+  const uid = requireClerkUserId(req, res);
+  if (!uid) return;
+  const org = await currentOrgForClerkUser(uid);
+  if (!org) {
+    res.status(404).json({ error: "no_org_for_user" });
+    return;
+  }
+  const thread = await getOpenRfiThreadForOrg(org.orgId);
+  if (!thread.case) {
+    res.status(404).json({ error: "no_open_rfi" });
+    return;
+  }
+  res.status(201).json(
+    await postCustomerCaseReply(org.orgId, uid, (thread.case as { id: string }).id, String(req.body?.body ?? "")),
+  );
 });
 
 // Public Receita lookup (BrasilAPI) to pre-fill the signup form. Authed so it's not an
@@ -332,6 +366,22 @@ app.post("/admin/orgs/:id/verdict", rateLimit("admin_export"), requireAdminServi
   });
   const { rows } = await pool.query("select id, state, admission_state from orgs where id = $1", [orgId]);
   res.json(rows[0] ?? null);
+});
+
+// Relay an Avenia EDD info request to the customer (org -> rfi_required + customer-visible
+// message). Modelo A: a relay, not a Lince request. Audit-logged inside raiseRfi.
+app.post("/admin/orgs/:id/rfi", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { adminClerkUserId, adminEmail, adminName, message } = req.body ?? {};
+  if (!adminClerkUserId || !adminEmail) {
+    res.status(400).json({ error: "missing_admin_identity" });
+    return;
+  }
+  if (!String(message ?? "").trim()) {
+    res.status(400).json({ error: "message_required" });
+    return;
+  }
+  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  res.json(await raiseRfi({ orgId: String(req.params.id), adminId, message: String(message) }));
 });
 
 // Suspend / block / reinstate an org's access (the 0002 access_status seam). Lifecycle
