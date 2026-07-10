@@ -28,6 +28,40 @@ export function toMinor(amount: string, currency: Currency): bigint {
   return neg ? -value : value;
 }
 
+/**
+ * Vendor-supplied (Avenia) decimal amount -> minor units. LENIENT and NON-THROWING: rounds
+ * extra fractional digits to the currency's dp (half-up), returns 0n on a non-numeric string.
+ * Vendor amounts must NEVER crash a read or the settle path (a stray >dp fee once 500'd the
+ * whole transactions list). ponytail: rounds to our dp; if Avenia ever credits sub-centavo
+ * BRLA the remainder is lost — widen DECIMALS.BRLA when that becomes real.
+ */
+export function vendorMinor(amount: string, currency: Currency): bigint {
+  const dp = DECIMALS[currency];
+  const m = /^(-?)(\d+)(?:\.(\d+))?$/.exec(String(amount ?? "").trim());
+  if (!m) return 0n;
+  const sign = m[1];
+  const whole = m[2]!;
+  const frac = m[3] ?? "";
+  const base = 10n ** BigInt(dp);
+  let minor = BigInt(whole) * base + BigInt((frac + "0".repeat(dp)).slice(0, dp) || "0");
+  if (frac.length > dp && Number(frac[dp]) >= 5) minor += 1n; // round half-up
+  return sign === "-" ? -minor : minor;
+}
+
+/**
+ * Strict validation for CUSTOMER-entered money: a non-negative decimal with at most the
+ * currency's dp places, greater than zero and within a sane cap (well under int8). Returns the
+ * minor-unit bigint, or null if invalid (callers return 422). Never throws.
+ */
+const MAX_MINOR = 10n ** 13n; // ~100 billion units — far above any real deposit, far below int8 max
+export function parseCustomerAmount(amount: string, currency: Currency): bigint | null {
+  const dp = DECIMALS[currency];
+  const s = String(amount ?? "").trim();
+  if (!new RegExp(`^\\d+(?:\\.\\d{1,${dp}})?$`).test(s)) return null;
+  const v = toMinor(s, currency);
+  return v > 0n && v <= MAX_MINOR ? v : null;
+}
+
 /** 1234n -> "12.34" (for BRL). Presentation only. */
 export function fromMinor(minor: bigint, currency: Currency): string {
   const dp = DECIMALS[currency];

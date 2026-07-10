@@ -19,7 +19,7 @@
 import { createHash } from "node:crypto";
 import { pool, withTransaction } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
-import { toMinor, type Currency } from "../../money/money.js";
+import { parseCustomerAmount, vendorMinor, type Currency } from "../../money/money.js";
 import { ensureAveniaSubaccount } from "../onboarding/aveniaProvisioning.js";
 import { applyTicketStatus, APPLY_ROW_COLUMNS, type ApplyRow } from "./ticketApply.js";
 import type { DepositRail, SubAccountCreator, AccountInfoReader, TicketReader } from "../providers/avenia/avenia.client.js";
@@ -64,7 +64,8 @@ function receiptFrom(row: TxRow): DepositReceipt {
     destAmount: row.dest_amount === null ? null : Number(row.dest_amount),
     fees: (quote.appliedFees ?? []).map((f) => ({
       label: f.type,
-      amount: Number(toMinor(f.amount, (f.currency as Currency) ?? "BRL")),
+      // vendorMinor is lenient + non-throwing: a stray fee precision never crashes the read.
+      amount: Number(vendorMinor(f.amount, (f.currency as Currency) ?? "BRL")),
       currency: f.currency,
       rebatable: f.rebatable,
     })),
@@ -78,8 +79,10 @@ export async function createDeposit(
   client: DepositClient | null,
 ): Promise<DepositReceipt> {
   if (!client) throw new HttpError("avenia_unavailable", 503);
-  const amountMinor = toMinor(input.amountBrl, "BRL"); // throws on >2dp
-  if (amountMinor <= 0n) throw new HttpError("invalid_amount", 422);
+  // Strict customer-input validation BEFORE any parsing/DB work — malformed amounts (1e9,
+  // empty, >2dp, out-of-range) become a clean 422, never an uncaught throw / int8 overflow.
+  const amountMinor = parseCustomerAmount(input.amountBrl, "BRL");
+  if (amountMinor === null) throw new HttpError("invalid_amount", 422);
   const hash = canonicalHash(orgId, input.amountBrl);
 
   // Idempotency claim (pattern 5): first inserter owns the Avenia call.
@@ -106,11 +109,13 @@ export async function createDeposit(
   const txId = claim.rows[0]!.id;
 
   // Own the claim: subaccount (lazily healed for pre-provisioning orgs), then quote+ticket.
+  // externalId = idem_key makes the Avenia ticket idempotent: a retry won't duplicate it, and
+  // the reconciler can recover the ticket by externalId if we crash before persisting its id.
   let result;
   try {
     const sub = await ensureAveniaSubaccount(orgId, client);
     if (!sub) throw new Error("no subaccount");
-    result = await client.createPixDeposit({ subAccountId: sub, amountBrl: input.amountBrl });
+    result = await client.createPixDeposit({ subAccountId: sub, amountBrl: input.amountBrl, externalId: input.idemKey });
   } catch (e) {
     await pool.query(
       `update org_transactions set state = 'failed', error = $2, updated_at = now() where id = $1`,
@@ -119,7 +124,9 @@ export async function createDeposit(
     throw e instanceof HttpError ? e : new HttpError("deposit_unavailable", 502);
   }
 
-  const destMinor = toMinor(result.quote.outputAmount, "BRLA");
+  // vendorMinor is non-throwing (rounds Avenia's decimals to our dp): the post-ticket UPDATE
+  // can no longer throw and strand the row with the ticket already live at Avenia.
+  const destMinor = vendorMinor(result.quote.outputAmount, "BRLA");
   const quoteSnapshot = {
     ticketStatus: "UNPAID",
     brCode: result.brCode,
@@ -155,11 +162,13 @@ export async function createDeposit(
  * (rate limits unconfirmed — Avenia question #10).
  */
 export async function reconcileInFlightDeposits(rail: TicketReader, quietSeconds = 45, limit = 10): Promise<number> {
-  const { rows } = await pool.query<{ id: string; vendor_ref: string; subaccount_id: string | null }>(
-    `select t.id, t.vendor_ref, a.subaccount_id
+  // Includes 'created' rows with a NULL vendor_ref: these are crash-orphans (ticket live at
+  // Avenia, id never persisted). We recover them by externalId (= idem_key) below.
+  const { rows } = await pool.query<{ id: string; vendor_ref: string | null; idem_key: string; subaccount_id: string | null }>(
+    `select t.id, t.vendor_ref, t.idem_key::text as idem_key, a.subaccount_id
        from org_transactions t
        left join avenia_accounts a on a.org_id = t.org_id
-      where t.provider_code = 'avenia' and t.vendor_ref is not null
+      where t.provider_code = 'avenia'
         and t.state in ('created', 'funding', 'executing', 'on_hold')
         and t.updated_at < now() - make_interval(secs => $1)
       order by t.updated_at asc
@@ -169,19 +178,32 @@ export async function reconcileInFlightDeposits(rail: TicketReader, quietSeconds
   let applied = 0;
   for (const r of rows) {
     if (!r.subaccount_id) continue;
-    let status: string;
+    let ticket;
     try {
-      status = (await rail.getTicket({ subAccountId: r.subaccount_id, ticketId: r.vendor_ref })).status;
+      ticket = r.vendor_ref
+        ? await rail.getTicket({ subAccountId: r.subaccount_id, ticketId: r.vendor_ref })
+        : await rail.findTicketByExternalId({ subAccountId: r.subaccount_id, externalId: r.idem_key });
     } catch {
       continue; // transient Avenia error — next pass retries
     }
+    if (!ticket) continue; // orphan with no ticket at Avenia (create never happened) — leave it
     await withTransaction(async (c) => {
       const locked = await c.query<ApplyRow>(
         `select ${APPLY_ROW_COLUMNS} from org_transactions where id = $1 for update`,
         [r.id],
       );
       if (!locked.rows[0]) return;
-      if ((await applyTicketStatus(c, locked.rows[0], status)) === "apply") applied++;
+      // Backfill a recovered orphan's vendor_ref + dest_amount before applying status, so the
+      // settle posting has the credited amount.
+      if (!r.vendor_ref) {
+        const dest = ticket.outputAmount ? vendorMinor(ticket.outputAmount, "BRLA") : null;
+        await c.query(
+          `update org_transactions set vendor_ref = $2, dest_amount = coalesce(dest_amount, $3), updated_at = now() where id = $1`,
+          [r.id, ticket.id, dest],
+        );
+        locked.rows[0].dest_amount = (locked.rows[0].dest_amount ?? (dest === null ? null : String(dest)));
+      }
+      if ((await applyTicketStatus(c, locked.rows[0], ticket.status)) === "apply") applied++;
     });
   }
   return applied;
@@ -213,7 +235,7 @@ export async function listTransactionsForOrg(orgId: string): Promise<unknown[]> 
       destAmount: r.dest_amount === null ? 0 : Number(r.dest_amount),
       fees: (quote.appliedFees ?? []).map((f) => ({
         label: f.type,
-        amount: Number(toMinor(f.amount, (f.currency as Currency) ?? "BRL")),
+        amount: Number(vendorMinor(f.amount, (f.currency as Currency) ?? "BRL")),
         currency: f.currency,
         rebatable: f.rebatable,
       })),

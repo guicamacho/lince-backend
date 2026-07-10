@@ -153,7 +153,7 @@ test("reconciler settles a quiet in-flight deposit when webhooks never arrive", 
   const receipt = await createDeposit(orgId, null, { amountBrl: "100", idemKey: randomUUID() }, fakeClient());
   // age the row past the quiet window (webhooks would normally win inside it)
   await pool.query("update org_transactions set updated_at = now() - interval '10 minutes' where id = $1", [receipt.id]);
-  const rail = { async getTicket() { return { id: "tkt_1", status: "PAID" }; } };
+  const rail = { async getTicket() { return { id: "tkt_1", status: "PAID" }; }, async findTicketByExternalId() { return null; } };
   const applied = await reconcileInFlightDeposits(rail, 45, 10);
   assert.equal(applied, 1);
   const { rows } = await pool.query("select state, quote->>'ticketStatus' as ts from org_transactions where id = $1", [receipt.id]);
@@ -161,4 +161,64 @@ test("reconciler settles a quiet in-flight deposit when webhooks never arrive", 
   assert.equal(rows[0].ts, "PAID");
   // second pass: nothing left in flight
   assert.equal(await reconcileInFlightDeposits(rail, 45, 10), 0);
+});
+
+test("invalid amountBrl -> 422 before any ticket/DB work", async () => {
+  const orgId = await createOrg("active");
+  const client = fakeClient();
+  for (const bad of ["1e9", "", "0", "100.123", "  ", "0x10", "-5"]) {
+    await assert.rejects(
+      () => createDeposit(orgId, null, { amountBrl: bad, idemKey: randomUUID() }, client),
+      /invalid_amount/,
+      `expected 422 for ${JSON.stringify(bad)}`,
+    );
+  }
+  assert.equal(client.tickets, 0, "no Avenia ticket created for any invalid amount");
+});
+
+test("Avenia outputAmount with >2dp does not throw — deposit settles with rounded dest_amount", async () => {
+  const orgId = await createOrg("active");
+  // client returns a 3-decimal BRLA outputAmount (the old toMinor would have thrown here)
+  const client = {
+    async createSubAccount() { return { id: "sub_x" }; },
+    async getAccountInfo() { return {}; },
+    async createPixDeposit({ amountBrl }: { amountBrl: string }) {
+      return {
+        ticketId: "tkt_r", brCode: "00020126...", expiration: "",
+        quote: { inputCurrency: "BRL", inputAmount: amountBrl, outputCurrency: "BRLA",
+          outputAmount: "99.808", basePrice: "1", pairName: "BRLBRLA",
+          appliedFees: [{ type: "In Fee", amount: "0.015", currency: "BRL", rebatable: true }] },
+      };
+    },
+  } as unknown as DepositClient;
+  const receipt = await createDeposit(orgId, null, { amountBrl: "100", idemKey: randomUUID() }, client);
+  assert.equal(receipt.state, "funding");
+  assert.equal(receipt.destAmount, 9981); // 99.808 -> 99.81 rounded to 2dp
+  assert.equal(receipt.fees[0]!.amount, 2); // 0.015 -> 0.02
+});
+
+test("reconciler recovers a crash-orphan ('created', null vendor_ref) via externalId", async () => {
+  const orgId = await createOrg("active");
+  // simulate the crash window: a claim row that never got its vendor_ref persisted.
+  const idemKey = randomUUID();
+  await pool.query("insert into avenia_accounts (org_id, subaccount_id) values ($1, 'sub_o')", [orgId]);
+  const ins = await pool.query<{ id: string }>(
+    `insert into org_transactions (org_id, type, state, source_currency, source_amount, dest_currency, provider_code, idem_key)
+     values ($1,'deposit','created','BRL',10000,'BRLA','avenia',$2) returning id`,
+    [orgId, idemKey],
+  );
+  await pool.query("update org_transactions set updated_at = now() - interval '10 minutes' where id = $1", [ins.rows[0]!.id]);
+  const rail = {
+    async getTicket() { throw new Error("should not be called for a null vendor_ref row"); },
+    async findTicketByExternalId({ externalId }: { externalId: string }) {
+      assert.equal(externalId, idemKey);
+      return { id: "tkt_recovered", status: "PAID", outputAmount: "99.80" };
+    },
+  };
+  const applied = await reconcileInFlightDeposits(rail, 45, 10);
+  assert.equal(applied, 1);
+  const { rows } = await pool.query("select state, vendor_ref, dest_amount from org_transactions where id = $1", [ins.rows[0]!.id]);
+  assert.equal(rows[0].vendor_ref, "tkt_recovered");
+  assert.equal(rows[0].dest_amount, "9980");
+  assert.equal(rows[0].state, "settled");
 });

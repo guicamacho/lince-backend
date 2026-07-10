@@ -47,11 +47,20 @@ export interface AveniaDepositResult {
 }
 
 export interface DepositRail {
-  createPixDeposit(input: { subAccountId: string; amountBrl: string }): Promise<AveniaDepositResult>;
+  createPixDeposit(input: { subAccountId: string; amountBrl: string; externalId?: string }): Promise<AveniaDepositResult>;
 }
 
+export interface TicketView {
+  id: string;
+  status: string;
+  outputAmount?: string; // the credited amount (decimal string) from the ticket's quote
+}
 export interface TicketReader {
-  getTicket(input: { subAccountId: string; ticketId: string }): Promise<{ id: string; status: string }>;
+  getTicket(input: { subAccountId: string; ticketId: string }): Promise<TicketView>;
+  /** Recover a ticket by the externalId we set at creation (our idem_key) — used to heal a
+   *  deposit row that owns a live ticket but never persisted its id (crash mid-create). Null if
+   *  none. */
+  findTicketByExternalId(input: { subAccountId: string; externalId: string }): Promise<TicketView | null>;
 }
 
 export class AveniaClient implements RailProvider, SubAccountCreator, AccountInfoReader, DepositRail, TicketReader {
@@ -59,19 +68,29 @@ export class AveniaClient implements RailProvider, SubAccountCreator, AccountInf
 
   /** One ticket's current status — the reconciler's poll (subAccountId must match the
    *  quote's scoping or Avenia 404s). */
-  async getTicket(input: { subAccountId: string; ticketId: string }): Promise<{ id: string; status: string }> {
+  async getTicket(input: { subAccountId: string; ticketId: string }): Promise<TicketView> {
     const requestUri = `/v2/account/tickets/${encodeURIComponent(input.ticketId)}?subAccountId=${encodeURIComponent(input.subAccountId)}`;
     const res = await fetch(`${this.config.baseUrl}${requestUri}`, { headers: this.signedHeaders("GET", requestUri) });
     if (!res.ok) throw new Error(`avenia ticket get ${res.status}: ${(await res.text()).slice(0, 200)}`);
-    const out = (await res.json()) as { ticket?: { id?: string; status?: string } };
+    const out = (await res.json()) as { ticket?: { id?: string; status?: string; quote?: { outputAmount?: string } } };
     if (!out.ticket?.id || !out.ticket.status) throw new Error("avenia ticket get: missing id/status");
-    return { id: out.ticket.id, status: out.ticket.status };
+    return { id: out.ticket.id, status: out.ticket.status, outputAmount: out.ticket.quote?.outputAmount };
+  }
+
+  /** List the subaccount's tickets filtered by externalId (our idem_key), returning the first. */
+  async findTicketByExternalId(input: { subAccountId: string; externalId: string }): Promise<TicketView | null> {
+    const requestUri = `/v2/account/tickets/?subAccountId=${encodeURIComponent(input.subAccountId)}&externalId=${encodeURIComponent(input.externalId)}`;
+    const res = await fetch(`${this.config.baseUrl}${requestUri}`, { headers: this.signedHeaders("GET", requestUri) });
+    if (!res.ok) throw new Error(`avenia ticket list ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const out = (await res.json()) as { tickets?: Array<{ id?: string; status?: string; quote?: { outputAmount?: string } }> };
+    const t = out.tickets?.[0];
+    return t?.id && t.status ? { id: t.id, status: t.status, outputAmount: t.quote?.outputAmount } : null;
   }
 
   /** PIX-in deposit for a subaccount: quote + ticket inside the 15s quoteToken window.
    *  Returns the brCode the customer pays; nothing moves until it's paid. The nil-UUID
    *  beneficiaryWalletId means "this subaccount" — resolved from subAccountId at quote time. */
-  async createPixDeposit(input: { subAccountId: string; amountBrl: string }): Promise<AveniaDepositResult> {
+  async createPixDeposit(input: { subAccountId: string; amountBrl: string; externalId?: string }): Promise<AveniaDepositResult> {
     const q = new URLSearchParams({
       inputCurrency: "BRL",
       inputPaymentMethod: "PIX",
@@ -93,6 +112,9 @@ export class AveniaClient implements RailProvider, SubAccountCreator, AccountInf
     const body = JSON.stringify({
       quoteToken: quote.quoteToken,
       ticketBlockchainOutput: { beneficiaryWalletId: "00000000-0000-0000-0000-000000000000" },
+      // Vendor idempotency: our idem_key. A retry with the same key won't create a duplicate
+      // ticket, and lets the reconciler recover a ticket whose id we failed to persist.
+      ...(input.externalId ? { externalId: input.externalId } : {}),
     });
     const ticketRes = await fetch(`${this.config.baseUrl}${ticketUri}`, {
       method: "POST",
