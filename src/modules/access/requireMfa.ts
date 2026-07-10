@@ -1,86 +1,100 @@
 /**
- * MFA policy gate for sensitive mutations.
+ * MFA gates for sensitive mutations. Two distinct questions, two signals — do not conflate:
  *
- * Mirror of requireStepUp.ts: a PURE decision (unit-testable, no Clerk/Express) plus a
- * thin Express middleware that reads the caller's Clerk auth and applies it.
+ *   - ENROLLMENT ("does this user have 2FA set up?") — authoritative via the Clerk Backend
+ *     API (`user.twoFactorEnabled`). This is what the payee/money-out gate needs, and it is
+ *     the SAME signal the customer UI gates on (currentUser().twoFactorEnabled), so the two
+ *     agree — no "form shown then hard-403'd" lockout.
+ *   - VERIFICATION FRESHNESS ("was the 2nd factor verified recently in THIS session?") — the
+ *     `fva` session claim, used by requireStepUp for re-challenge. NOT an enrollment flag.
  *
- * Ruling (PRD-07 v5, 2026-07-04): policy is OPTIONAL by default (config-only flip to
- * mandatory); SMS is disabled (a Clerk-dashboard setting mirrored as the documented
- * MFA_SMS_ENABLED flag — no factor-selection code lives here); the 24h post-recovery
- * money-out hold lives in recoveryHold.ts. When policy is "optional" this is a
- * pass-through — auth is already handled by the outer /app active-org gate.
+ * An earlier version gated payees on `fva` (verification age). That was wrong: it fails open
+ * on non-numeric claim shapes, fails open for ~1 token TTL after 2FA is disabled, and blocks
+ * enrolled users whose session predates enrollment. Adversarial review (2026-07-10) confirmed
+ * all three. The payee gate now reads enrollment authoritatively and fails CLOSED on any error.
  *
- * Second-factor signal = the free Clerk session claim `fva` (factor-verification age):
- * fva[1] is the age of the SECOND factor; -1 means "never verified / not enrolled". This
- * is synchronous (no Backend API round-trip). `fva` is @experimental — flagged.
- *
- * Mount + env wiring land in Wave 2; the factory takes `policy` so wiring is one line
- * (`requireMfa(env.mfa.policy)`) — same seam as requireStepUp(env.stepUp.enforced).
+ * Ruling (PRD-07 v5): global MFA policy is OPTIONAL by default; SMS disabled; 24h post-recovery
+ * money-out hold lives in recoveryHold.ts.
  */
 import type { Request, Response, NextFunction } from "express";
-import { getAuth } from "@clerk/express";
+import { getAuth, clerkClient } from "@clerk/express";
 
 export type MfaPolicy = "optional" | "mandatory";
 export type MfaDecision = "ok" | "unauthenticated" | "mfa_required";
 
-/** Pure gate. policy "optional" => always ok (the ratified default). */
+/** Pure gate for the global policy. policy "optional" => always ok (the ratified default). */
 export function mfaDecision(
   policy: MfaPolicy,
   userId: string | null | undefined,
-  secondFactorPresent: boolean,
+  secondFactorEnrolled: boolean,
 ): MfaDecision {
   if (policy === "optional") return "ok";
   if (!userId) return "unauthenticated";
-  if (!secondFactorPresent) return "mfa_required";
+  if (!secondFactorEnrolled) return "mfa_required";
   return "ok";
 }
 
-/** fva = [firstFactorAge, secondFactorAge]; secondFactorAge === -1 => no 2FA verified. */
-export function hasSecondFactor(fva: unknown): boolean {
-  return Array.isArray(fva) && fva[1] !== -1 && fva[1] !== undefined;
+export type GateResult = "ok" | { status: number; body: Record<string, unknown> };
+
+/**
+ * Pure enrollment gate (the whole security decision, no Clerk/Express). Fails CLOSED:
+ * no user => 401; lookup throws => 503 (never allow the action we can't verify); not
+ * enrolled => 403; enrolled => ok. Unit-tested; the middleware below is thin glue.
+ */
+export async function mfaEnrolledGate(
+  userId: string | null | undefined,
+  isEnrolled: (id: string) => Promise<boolean>,
+): Promise<GateResult> {
+  if (!userId) return { status: 401, body: { error: "unauthenticated" } };
+  let enrolled: boolean;
+  try {
+    enrolled = await isEnrolled(userId);
+  } catch {
+    return { status: 503, body: { error: "mfa_check_unavailable" } };
+  }
+  return enrolled ? "ok" : { status: 403, body: { error: "mfa_required", action: "enrol" } };
 }
 
 /**
- * Express middleware. `policy` defaults to the MFA_POLICY env flag (only exactly
- * "mandatory" flips it — the ruling default is optional); Wave 2 passes env.mfa.policy
- * explicitly — one line, same seam as requireStepUp.
+ * Always require an ENROLLED second factor, independent of the global (optional) MFA policy.
+ * Used on the payee/money-out surface: adding a beneficiary requires 2FA — the first payee is
+ * the enrollment trigger (PRD-02 F4). Enrollment persists, so later payees pass without
+ * friction; this is not a step-up re-challenge (requireStepUp handles fresh re-verification).
+ *
+ * Reads `twoFactorEnabled` from the Clerk Backend API — authoritative and current (a disabled
+ * factor is reflected immediately, unlike the TTL-bounded session claim). Fails CLOSED: any
+ * lookup error blocks the money-out action rather than letting it through.
  */
-export function requireMfa(
-  policy: MfaPolicy = process.env.MFA_POLICY === "mandatory" ? "mandatory" : "optional",
-) {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const { userId, sessionClaims } = getAuth(req);
-    switch (mfaDecision(policy, userId, hasSecondFactor(sessionClaims?.fva))) {
-      case "unauthenticated":
-        res.status(401).json({ error: "unauthenticated" });
-        return;
-      case "mfa_required":
-        res.status(403).json({ error: "mfa_required", action: "enrol" });
-        return;
-      default:
-        next();
-    }
+type EnrollmentClient = { users: { getUser: (id: string) => Promise<{ twoFactorEnabled: boolean }> } };
+
+/** true iff the Clerk user has an enrolled second factor (authoritative, current). */
+const enrolledVia = (client: EnrollmentClient) => async (id: string): Promise<boolean> =>
+  (await client.users.getUser(id)).twoFactorEnabled === true;
+
+async function applyGate(res: Response, next: NextFunction, result: GateResult): Promise<void> {
+  if (result === "ok") next();
+  else res.status(result.status).json(result.body);
+}
+
+export function requireMfaEnrolled(client: EnrollmentClient = clerkClient) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    await applyGate(res, next, await mfaEnrolledGate(getAuth(req).userId, enrolledVia(client)));
   };
 }
 
 /**
- * Always require an enrolled second factor, independent of the global (optional) MFA policy.
- * Used on the payee/money-out surface: adding a beneficiary requires 2FA — the first payee
- * is the enrollment trigger (PRD-02 F4 money-out hardening; product decision 2026-07-10).
- * Not a step-up re-challenge: presence of the second factor persists once enrolled, so
- * later payees pass without friction. requireStepUp handles fresh re-verification separately.
+ * Global MFA policy middleware (optional by default = pass-through). When "mandatory", reads
+ * enrollment authoritatively — same source as the payee gate. Wave 2 passes env.mfa.policy.
  */
-export function requireSecondFactor() {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const { userId, sessionClaims } = getAuth(req);
-    if (!userId) {
-      res.status(401).json({ error: "unauthenticated" });
+export function requireMfa(
+  policy: MfaPolicy = process.env.MFA_POLICY === "mandatory" ? "mandatory" : "optional",
+  client: EnrollmentClient = clerkClient,
+) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    if (policy === "optional") {
+      next();
       return;
     }
-    if (!hasSecondFactor(sessionClaims?.fva)) {
-      res.status(403).json({ error: "mfa_required", action: "enrol" });
-      return;
-    }
-    next();
+    await applyGate(res, next, await mfaEnrolledGate(getAuth(req).userId, enrolledVia(client)));
   };
 }

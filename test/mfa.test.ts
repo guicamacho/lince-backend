@@ -1,36 +1,45 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mfaDecision, hasSecondFactor } from "../src/modules/access/requireMfa.js";
+import { mfaDecision, mfaEnrolledGate } from "../src/modules/access/requireMfa.js";
 
-// Pure decision — the whole gate lives here; the middleware is thin glue over it.
-test("policy optional => ok regardless of factors (ratified default)", () => {
+// --- pure global-policy decision (enrollment-based) ---
+test("policy optional => ok regardless of enrollment (ratified default)", () => {
   assert.equal(mfaDecision("optional", undefined, false), "ok");
   assert.equal(mfaDecision("optional", "user_1", false), "ok");
 });
-
 test("mandatory + no user => unauthenticated", () => {
   assert.equal(mfaDecision("mandatory", null, false), "unauthenticated");
 });
-
-test("mandatory + user + no second factor => mfa_required", () => {
+test("mandatory + user + not enrolled => mfa_required", () => {
   assert.equal(mfaDecision("mandatory", "user_1", false), "mfa_required");
 });
-
-test("mandatory + user + second factor present => ok", () => {
+test("mandatory + user + enrolled => ok", () => {
   assert.equal(mfaDecision("mandatory", "user_1", true), "ok");
 });
 
-// hasSecondFactor reads the Clerk fva claim [firstFactorAge, secondFactorAge].
-// -1 (or missing) second-factor age = not enrolled; any real age = enrolled.
-test("hasSecondFactor: fva[1] === -1 => not enrolled", () => {
-  assert.equal(hasSecondFactor([0, -1]), false);
+// --- the payee/money-out gate: authoritative enrollment, FAIL-CLOSED ---
+const enrolled = async () => true;
+const notEnrolled = async () => false;
+const throws = async (): Promise<boolean> => {
+  throw new Error("clerk down");
+};
+
+test("enrolled user => ok (money-out allowed)", async () => {
+  assert.equal(await mfaEnrolledGate("user_1", enrolled), "ok");
 });
-test("hasSecondFactor: fva[1] is a real age => enrolled (payee gate passes)", () => {
-  assert.equal(hasSecondFactor([12, 0]), true);
-  assert.equal(hasSecondFactor([12, 300]), true);
+
+test("not-enrolled user => 403 mfa_required (blocked, the first-payee trigger)", async () => {
+  const r = await mfaEnrolledGate("user_1", notEnrolled);
+  assert.deepEqual(r, { status: 403, body: { error: "mfa_required", action: "enrol" } });
 });
-test("hasSecondFactor: missing/short claim => not enrolled (fail closed)", () => {
-  assert.equal(hasSecondFactor(undefined), false);
-  assert.equal(hasSecondFactor([0]), false);
-  assert.equal(hasSecondFactor("nope"), false);
+
+test("no userId => 401", async () => {
+  assert.deepEqual(await mfaEnrolledGate(null, enrolled), { status: 401, body: { error: "unauthenticated" } });
+  assert.deepEqual(await mfaEnrolledGate(undefined, enrolled), { status: 401, body: { error: "unauthenticated" } });
+});
+
+test("lookup throws => FAILS CLOSED (503, never ok)", async () => {
+  const r = await mfaEnrolledGate("user_1", throws);
+  assert.notEqual(r, "ok", "must NOT allow the money-out action when enrollment can't be verified");
+  assert.deepEqual(r, { status: 503, body: { error: "mfa_check_unavailable" } });
 });
