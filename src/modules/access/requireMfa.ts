@@ -17,7 +17,7 @@
  * money-out hold lives in recoveryHold.ts.
  */
 import type { Request, Response, NextFunction } from "express";
-import { getAuth, clerkClient } from "@clerk/express";
+import { getAuth } from "@clerk/express";
 
 export type MfaPolicy = "optional" | "mandatory";
 export type MfaDecision = "ok" | "unauthenticated" | "mfa_required";
@@ -56,45 +56,55 @@ export async function mfaEnrolledGate(
 }
 
 /**
- * Always require an ENROLLED second factor, independent of the global (optional) MFA policy.
- * Used on the payee/money-out surface: adding a beneficiary requires 2FA — the first payee is
- * the enrollment trigger (PRD-02 F4). Enrollment persists, so later payees pass without
- * friction; this is not a step-up re-challenge (requireStepUp handles fresh re-verification).
- *
- * Reads `twoFactorEnabled` from the Clerk Backend API — authoritative and current (a disabled
- * factor is reflected immediately, unlike the TTL-bounded session claim). Fails CLOSED: any
- * lookup error blocks the money-out action rather than letting it through.
+ * MFA is satisfied by EITHER a second factor (TOTP) OR a passkey — product ruling 2026-07-10
+ * ("you only need one, Authenticator or Passkey"). NOTE: Clerk's `two_factor_enabled` does NOT
+ * count passkeys (they're a first-factor strategy), and the @clerk SDK's user object silently
+ * drops the `passkeys` field — so we read the RAW Clerk API, which returns both.
  */
-type EnrollmentClient = { users: { getUser: (id: string) => Promise<{ twoFactorEnabled: boolean }> } };
+export function computeHasMfa(u: { two_factor_enabled?: boolean; passkeys?: unknown[] }): boolean {
+  return u.two_factor_enabled === true || (Array.isArray(u.passkeys) && u.passkeys.length > 0);
+}
 
-/** true iff the Clerk user has an enrolled second factor (authoritative, current). */
-const enrolledVia = (client: EnrollmentClient) => async (id: string): Promise<boolean> =>
-  (await client.users.getUser(id)).twoFactorEnabled === true;
+/** Raw Clerk API user fetch (the SDK drops `passkeys`). Throws on non-2xx => gate fails closed. */
+async function clerkUserHasMfa(userId: string): Promise<boolean> {
+  const res = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`, {
+    headers: { Authorization: `Bearer ${process.env.CLERK_SECRET_KEY ?? ""}` },
+  });
+  if (!res.ok) throw new Error(`clerk users.get ${res.status}`);
+  return computeHasMfa((await res.json()) as { two_factor_enabled?: boolean; passkeys?: unknown[] });
+}
 
+/**
+ * Always require MFA (TOTP or passkey), independent of the global (optional) MFA policy. Used on
+ * the payee/money-out surface: adding a beneficiary requires MFA — the first payee is the
+ * enrollment trigger (PRD-02 F4). Authoritative + current (a removed factor reflects immediately);
+ * fails CLOSED — any lookup error blocks the money-out action rather than letting it through.
+ * `isEnrolled` is injectable for tests.
+ */
 async function applyGate(res: Response, next: NextFunction, result: GateResult): Promise<void> {
   if (result === "ok") next();
   else res.status(result.status).json(result.body);
 }
 
-export function requireMfaEnrolled(client: EnrollmentClient = clerkClient) {
+export function requireMfaEnrolled(isEnrolled: (id: string) => Promise<boolean> = clerkUserHasMfa) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    await applyGate(res, next, await mfaEnrolledGate(getAuth(req).userId, enrolledVia(client)));
+    await applyGate(res, next, await mfaEnrolledGate(getAuth(req).userId, isEnrolled));
   };
 }
 
 /**
- * Global MFA policy middleware (optional by default = pass-through). When "mandatory", reads
- * enrollment authoritatively — same source as the payee gate. Wave 2 passes env.mfa.policy.
+ * Global MFA policy middleware (optional by default = pass-through). When "mandatory", uses the
+ * same "TOTP or passkey" check as the payee gate. Wave 2 passes env.mfa.policy.
  */
 export function requireMfa(
   policy: MfaPolicy = process.env.MFA_POLICY === "mandatory" ? "mandatory" : "optional",
-  client: EnrollmentClient = clerkClient,
+  isEnrolled: (id: string) => Promise<boolean> = clerkUserHasMfa,
 ) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     if (policy === "optional") {
       next();
       return;
     }
-    await applyGate(res, next, await mfaEnrolledGate(getAuth(req).userId, enrolledVia(client)));
+    await applyGate(res, next, await mfaEnrolledGate(getAuth(req).userId, isEnrolled));
   };
 }

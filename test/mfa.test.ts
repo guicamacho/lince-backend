@@ -1,6 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mfaDecision, mfaEnrolledGate } from "../src/modules/access/requireMfa.js";
+import { mfaDecision, mfaEnrolledGate, computeHasMfa } from "../src/modules/access/requireMfa.js";
+
+// --- MFA satisfied by EITHER TOTP (two_factor_enabled) OR a passkey (ruling 2026-07-10) ---
+test("computeHasMfa: TOTP alone satisfies", () => {
+  assert.equal(computeHasMfa({ two_factor_enabled: true, passkeys: [] }), true);
+});
+test("computeHasMfa: a passkey alone satisfies (two_factor stays false in Clerk)", () => {
+  assert.equal(computeHasMfa({ two_factor_enabled: false, passkeys: [{ id: "pk" }] }), true);
+});
+test("computeHasMfa: neither => not satisfied", () => {
+  assert.equal(computeHasMfa({ two_factor_enabled: false, passkeys: [] }), false);
+  assert.equal(computeHasMfa({}), false);
+});
 
 // --- pure global-policy decision (enrollment-based) ---
 test("policy optional => ok regardless of enrollment (ratified default)", () => {
