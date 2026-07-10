@@ -14,6 +14,7 @@
 import type pg from "pg";
 import { ticketTransitionAllowed, normalizeTicketStatus } from "../webhooks/ticketState.js";
 import { ensureAccount, postBalancedTransactionOn } from "../ledger/ledger.service.js";
+import { DuplicateLedgerPostError } from "../ledger/ledger.types.js";
 import type { TicketState } from "../providers/provider.types.js";
 import type { Currency } from "../../money/money.js";
 
@@ -67,14 +68,21 @@ export async function applyTicketStatus(
     const orgAccount = await ensureAccount(client, {
       key: `org:${tx.org_id}:${currency}`, type: "customer_liability", orgId: tx.org_id, currency,
     });
-    await postBalancedTransactionOn(client, {
-      description: `deposit settled (ticket actuals)`,
-      orgTransactionId: tx.id,
-      postings: [
-        { accountId: custody, amount: net, currency },
-        { accountId: orgAccount, amount: -net, currency },
-      ],
-    });
+    try {
+      await postBalancedTransactionOn(client, {
+        description: `deposit settled (ticket actuals)`,
+        orgTransactionId: tx.id,
+        idempotencyKey: `deposit-settle:${tx.id}`, // exactly-once DB backstop
+        postings: [
+          { accountId: custody, amount: net, currency },
+          { accountId: orgAccount, amount: -net, currency },
+        ],
+      });
+    } catch (e) {
+      // Already posted for this deposit (in-code guard regressed / raced): the state UPDATE
+      // above is idempotent, so swallow and treat as applied — never double-credit the ledger.
+      if (!(e instanceof DuplicateLedgerPostError)) throw e;
+    }
   }
   return "apply";
 }

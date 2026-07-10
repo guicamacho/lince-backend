@@ -12,5 +12,16 @@ export interface PostingInput {
 export interface PostBalancedTransactionInput {
   description: string;
   orgTransactionId?: string; // links to org_transactions when money-movement-originated
+  /** Unique key for a specific money event (e.g. `deposit-settle:{txId}`). A second post with
+   *  the same key hits the DB unique index — the exactly-once backstop. */
+  idempotencyKey?: string;
   postings: PostingInput[];
+}
+
+/** Thrown when a post with an already-used idempotencyKey is attempted (unique_violation). */
+export class DuplicateLedgerPostError extends Error {
+  constructor(readonly idempotencyKey: string) {
+    super(`ledger post already exists for ${idempotencyKey}`);
+    this.name = "DuplicateLedgerPostError";
+  }
 }

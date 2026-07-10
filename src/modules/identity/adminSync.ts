@@ -5,6 +5,14 @@
  * passes the verified identity here over a service-token call. We upsert the
  * `admin_users` row (link by clerk_user_id, else by email, else create) and return
  * its id — used as `admission_recorded_by` on the relay. RBAC/roles is out of skeleton scope.
+ *
+ * SECURITY NOTE (audit 2026-07-11): the identity is trusted because the /admin/* surface is
+ * service-token gated and the admin app (network-isolated) sets it from a verified Clerk
+ * session — the backend does NOT independently verify it. Consequence for maker-checker
+ * (currently DISABLED, MAKER_CHECKER_ENABLED=false): a holder of the service token could pass
+ * two distinct identities (auto-provisioned here) to defeat the four-eyes control. Before
+ * enabling maker-checker in prod, the decide path must bind the approver to a backend-verified
+ * admin session (or a pre-registered, non-auto-provisioned admin), not just a body field.
  */
 import { pool } from "../../db/pool.js";
 

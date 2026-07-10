@@ -70,6 +70,9 @@ import {
 import { raiseRfi } from "./modules/onboarding/rfi.service.js";
 
 export const app = express();
+// Trust exactly N proxy hops (Cloudflare tunnel + Fly) so req.ip is the real client IP for
+// rate limiting. Set via TRUST_PROXY_HOPS per environment; 0 in dev (no proxy). Never `true`.
+app.set("trust proxy", env.rateLimit.trustProxyHops);
 // Capture the raw body (needed to verify webhook signatures) while still parsing JSON.
 // Limit lifted to env.rateLimit.webhookMaxBytes (default 1mb) so webhook payloads aren't
 // truncated by express's 100kb default; other route bodies are tiny (flagged: global change).

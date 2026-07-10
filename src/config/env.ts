@@ -58,6 +58,11 @@ export const env = {
   rateLimit: {
     enforced: process.env.RATE_LIMIT_ENFORCED === "true",
     webhookMaxBytes: optional("WEBHOOK_MAX_BYTES") ?? "1mb",
+    // Exact number of trusted proxy hops in front of the app (Cloudflare tunnel + Fly). MUST be
+    // set to the real hop count before enabling rate limiting in prod: too low collapses every
+    // client to the edge IP (self-DoS), too high (or `true`) lets X-Forwarded-For be spoofed to
+    // bypass IP limits. Default 0 (dev has no proxy) — Express then uses the socket IP.
+    trustProxyHops: Number(optional("TRUST_PROXY_HOPS") ?? 0),
   },
   // Inbound webhook signing secrets (B3). Clerk lives under clerk.webhookSigningSecret;
   // resend is Svix-signed; avenia verifies against its published public key (no env secret —

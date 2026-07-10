@@ -12,7 +12,7 @@
 import type pg from "pg";
 import { withTransaction, pool } from "../../db/pool.js";
 import type { Currency } from "../../money/money.js";
-import type { PostBalancedTransactionInput, LedgerAccountType } from "./ledger.types.js";
+import { DuplicateLedgerPostError, type PostBalancedTransactionInput, type LedgerAccountType } from "./ledger.types.js";
 
 function assertBalancedPerCurrency(input: PostBalancedTransactionInput): void {
   const sums = new Map<string, bigint>();
@@ -32,10 +32,19 @@ export async function postBalancedTransactionOn(
   input: PostBalancedTransactionInput,
 ): Promise<string> {
   assertBalancedPerCurrency(input);
-  const { rows } = await client.query<{ id: string }>(
-    "insert into ledger_transactions (description, org_transaction_id) values ($1,$2) returning id",
-    [input.description, input.orgTransactionId ?? null],
-  );
+  let rows: { id: string }[];
+  try {
+    ({ rows } = await client.query<{ id: string }>(
+      "insert into ledger_transactions (description, org_transaction_id, idempotency_key) values ($1,$2,$3) returning id",
+      [input.description, input.orgTransactionId ?? null, input.idempotencyKey ?? null],
+    ));
+  } catch (e) {
+    // Exactly-once backstop: a second post with the same idempotency_key hits ledger_tx_idempotency_uq.
+    if (input.idempotencyKey && (e as { code?: string }).code === "23505") {
+      throw new DuplicateLedgerPostError(input.idempotencyKey);
+    }
+    throw e;
+  }
   const ledgerTxId = rows[0]!.id;
   for (const p of input.postings) {
     await client.query(
@@ -68,6 +77,10 @@ export async function ensureAccount(
 
 /** Customer-visible balances for an org: per-currency NEGATED sum of its liability
  *  accounts' postings (liabilities carry credit balances; the customer sees them positive). */
+// ponytail: Number() narrows the bigint balance for JSON. Safe within bounds: each deposit is
+// capped at MAX_MINOR (10^13) by parseCustomerAmount, and 2^53 ≈ 9.0×10^15 minor units, so an
+// org would need hundreds of max-cap deposits to lose precision. Serialize as string if BRLA
+// balances ever approach that (they won't in BR PJ payments).
 export async function balancesForOrg(orgId: string): Promise<Record<string, number>> {
   const { rows } = await pool.query<{ currency: string; bal: string }>(
     `select a.currency, coalesce(-sum(p.amount), 0)::text as bal

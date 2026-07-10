@@ -25,11 +25,13 @@ function keyFor(scope: KeyScope, req: Request, res: Response): string | null {
       return (res.locals.orgId as string | undefined) ?? null;
     case "admin":
       // Admin routes are service-token gated; the admin id lives in the request body (parsed
-      // in the handler, not here). Key on the caller IP at this layer — provisional.
-      return req.ip ?? null;
+      // in the handler, not here). Key on the caller IP. NEVER null — a missing IP falls into
+      // one shared bucket (still capped) rather than silently bypassing the limit.
+      return req.ip ?? "unknown-ip";
     case "ip":
-      // Needs `trust proxy` set for the real client IP behind Fly (deployment/Wave 2 concern).
-      return req.ip ?? null;
+      // Real client IP needs `trust proxy` set to the exact hop count (app.ts). Fall back to a
+      // shared bucket, never null, so an IP tier can't be bypassed by an absent/again-null IP.
+      return req.ip ?? "unknown-ip";
   }
 }
 

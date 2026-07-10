@@ -9,12 +9,14 @@
  */
 import { HttpError } from "../../http/error.js";
 import { pool } from "../../db/pool.js";
+import { currentOrgForClerkUser } from "./onboardingState.js";
 
 export interface CnpjLookupResult {
   razaoSocial: string;
   ativa: boolean;
-  /** Live org with this CNPJ already exists on Lince (early duplicate feedback). */
-  alreadyRegistered: boolean;
+  /** Live org with this CNPJ already exists on Lince (early duplicate feedback). Only present
+   *  for a new signup (caller has no org) — never a cross-tenant existence oracle for others. */
+  alreadyRegistered?: boolean;
 }
 
 /**
@@ -51,10 +53,7 @@ export function mapCnpjResponse(data: CnpjResponse): Omit<CnpjLookupResult, "alr
   return { razaoSocial, ativa };
 }
 
-// clerkUserId is retained for the route signature (app.ts) — throttling is now the
-// rateLimit("cnpj_lookup") middleware's job, so it is no longer read here.
 export async function lookupCnpj(clerkUserId: string, rawCnpj: string): Promise<CnpjLookupResult> {
-  void clerkUserId;
   const digits = normalizeCnpj(rawCnpj);
 
   let data: CnpjResponse;
@@ -71,5 +70,10 @@ export async function lookupCnpj(clerkUserId: string, rawCnpj: string): Promise<
     if (err instanceof HttpError) throw err;
     throw new HttpError("cnpj_lookup_unavailable", 502); // network / timeout / parse
   }
-  return { ...mapCnpjResponse(data), alreadyRegistered: await isCnpjRegistered(digits) };
+  // Cross-tenant oracle guard: only reveal "already registered" to a genuine NEW signup (caller
+  // has no org yet). An existing customer must not be able to probe which CNPJs bank with Lince.
+  // A same-CNPJ signup is still blocked at bootstrap (cnpj_already_registered 409) regardless.
+  const callerHasOrg = (await currentOrgForClerkUser(clerkUserId)) !== null;
+  const alreadyRegistered = callerHasOrg ? undefined : await isCnpjRegistered(digits);
+  return { ...mapCnpjResponse(data), ...(alreadyRegistered === undefined ? {} : { alreadyRegistered }) };
 }

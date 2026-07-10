@@ -72,7 +72,18 @@ export async function drainOutboxOnce(cfg: NotifyConfig, select: SelectAdapter =
         limit $2`,
       [MAX_ATTEMPTS, BATCH],
     );
-    for (const row of rows) await processRow(client, cfg, select, row);
+    // Per-row SAVEPOINT: a DB error while finalizing one row must NOT roll back the batch and
+    // re-send siblings whose external send already succeeded (mirrors the webhook processor).
+    for (const row of rows) {
+      await client.query("savepoint outbox_row");
+      try {
+        await processRow(client, cfg, select, row);
+        await client.query("release savepoint outbox_row");
+      } catch (err) {
+        await client.query("rollback to savepoint outbox_row");
+        console.warn("outbox.row_failed", { outboxId: row.id, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
     return rows.length;
   });
 }
