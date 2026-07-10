@@ -52,6 +52,38 @@ test("a second relay on an already-decided org -> admission_already_recorded (CA
   assert.equal(rows[0].state, "active");
 });
 
+test("TWO IN-FLIGHT conflicting relays -> exactly one wins, loser 409s (row lock proven)", async () => {
+  // The sequential test above would pass even without FOR UPDATE; this one wouldn't:
+  // both transactions read admission_state concurrently, so only the row lock forces
+  // the second to see the first's committed verdict (verification-sweep finding).
+  const admin = await createAdmin();
+  const org = await createOrg("vendor_pending");
+  const results = await Promise.allSettled([
+    recordAveniaVerdict({ orgId: org, decision: "approved", aveniaReference: "AV-RACE-A", recordedByAdminId: admin }),
+    recordAveniaVerdict({ orgId: org, decision: "rejected", aveniaReference: "AV-RACE-B", recordedByAdminId: admin }),
+  ]);
+  const ok = results.filter((r) => r.status === "fulfilled");
+  const failed = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+  assert.equal(ok.length, 1, "exactly one relay recorded");
+  assert.equal(failed.length, 1);
+  assert.match(String(failed[0]!.reason), /admission_already_recorded/);
+
+  // The org matches the WINNER (whichever it was) — never a blend, never a flip.
+  const { rows } = await pool.query(
+    "select state, admission_state, admission_external_ref from orgs where id = $1",
+    [org],
+  );
+  const winnerWasApprove = rows[0].admission_external_ref === "AV-RACE-A";
+  assert.equal(rows[0].admission_state, winnerWasApprove ? "approved" : "rejected");
+  assert.equal(rows[0].state, winnerWasApprove ? "active" : "rejected");
+  // Exactly one audit relay row.
+  const audit = await pool.query(
+    "select count(*)::int as n from audit_log where org_id = $1 and event = 'admission.avenia_verdict_relayed'",
+    [org],
+  );
+  assert.equal(audit.rows[0].n, 1);
+});
+
 test("guard: rejects relay for a non-avenia jurisdiction", async () => {
   // Temp non-avenia jurisdiction (e.g. a hypothetical lince-admitted market).
   await pool.query(

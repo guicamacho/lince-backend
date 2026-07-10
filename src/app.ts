@@ -509,7 +509,16 @@ app.post("/admin/cases/:id/assign", rateLimit("admin_export"), requireAdminServi
 });
 
 // Error handler — Express 5 forwards rejected async handlers here.
+// Contention timeouts (PRD-07 §7 "fail fast, RETRY SAFE"): pg 55P03 (lock_timeout) and
+// 57014 (statement_timeout/cancel) become a retryable 503 with a neutral body — never a
+// raw-message 500 a client would treat as fatal (verification-sweep finding, 2026-07-06).
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  const pgCode = err instanceof Error && "code" in err ? String((err as { code: unknown }).code) : null;
+  if (pgCode === "55P03" || pgCode === "57014") {
+    res.setHeader("Retry-After", "1");
+    res.status(503).json({ error: "temporarily_unavailable" });
+    return;
+  }
   const status =
     err instanceof Error && "statusCode" in err ? Number((err as { statusCode: unknown }).statusCode) || 500 : 500;
   res.status(status).json({ error: err instanceof Error ? err.message : "internal_error" });
