@@ -28,6 +28,7 @@ export interface RaiseRfiInput {
 export async function raiseRfi(input: RaiseRfiInput): Promise<{ caseId: string; state: OrgState }> {
   const message = String(input.message ?? "").trim();
   if (!message) throw new HttpError("message_required", 400);
+  if (message.length > 5000) throw new HttpError("message_too_long", 422);
 
   return withTransaction(async (c) => {
     const { rows } = await c.query<{ state: OrgState }>(

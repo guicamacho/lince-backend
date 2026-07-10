@@ -11,7 +11,7 @@
  * Returns the HTTP status the route should send; the integrator delegates the route body here.
  */
 import { pool } from "../../db/pool.js";
-import { verifyWebhook, VERIFIED_PROVIDERS, type VerifierConfig, type WebhookHeaders } from "./verify.js";
+import { verifyWebhook, VERIFIED_PROVIDERS, KNOWN_PROVIDERS, type VerifierConfig, type WebhookHeaders } from "./verify.js";
 
 export interface ReceiveInput {
   provider: string;
@@ -31,6 +31,12 @@ export interface ReceiptOutcome {
 
 export async function receiveWebhook(input: ReceiveInput): Promise<ReceiptOutcome> {
   const { provider, externalId, eventType, rawBody, payload, headers, config, clientIp } = input;
+
+  // Reject unknown providers BEFORE any insert: the route is unauthenticated + un-throttled,
+  // so storing arbitrary-provider bodies is an unbounded storage-exhaustion vector.
+  if (!KNOWN_PROVIDERS.has(provider)) {
+    return { status: 404, body: { error: "unknown_provider" } };
+  }
 
   if (VERIFIED_PROVIDERS.has(provider)) {
     const configured =

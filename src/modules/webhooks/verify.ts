@@ -32,6 +32,9 @@ export interface VerifierConfig {
 export const SVIX_PROVIDERS = new Set(["clerk", "resend"]);
 /** Providers with a CONFIRMED inbound scheme — signature required at intake. */
 export const VERIFIED_PROVIDERS = new Set(["clerk", "resend", "avenia"]);
+/** Every provider the intake will accept. Anything else is rejected (no unbounded storage of
+ *  unauthenticated junk). didit is known but store-only (scheme unconfirmed). */
+export const KNOWN_PROVIDERS = new Set(["clerk", "resend", "avenia", "didit"]);
 
 function verifySvix(secret: string, rawBody: string, headers: WebhookHeaders): VerifyResult {
   try {

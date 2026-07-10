@@ -8,7 +8,15 @@
  * Returns 503 if unconfigured, 401 on a bad/missing token.
  */
 import type { Request, Response, NextFunction } from "express";
+import { timingSafeEqual } from "node:crypto";
 import { env } from "../../config/env.js";
+
+/** Constant-time compare — no early-exit timing oracle on the shared admin secret. */
+function tokensMatch(candidate: string, token: string): boolean {
+  const a = Buffer.from(candidate);
+  const b = Buffer.from(token);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 export function requireAdminServiceToken(req: Request, res: Response, next: NextFunction): void {
   const token = env.adminServiceToken;
@@ -16,7 +24,7 @@ export function requireAdminServiceToken(req: Request, res: Response, next: Next
     res.status(503).json({ error: "admin_not_configured" });
     return;
   }
-  if (req.header("x-admin-service-token") !== token) {
+  if (!tokensMatch(req.header("x-admin-service-token") ?? "", token)) {
     res.status(401).json({ error: "unauthorized" });
     return;
   }

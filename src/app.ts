@@ -102,15 +102,18 @@ const webhookVerifierConfig = {
 };
 
 // Shared webhook route body: build the receipt input from the request and delegate to the
-// inbox module (verify → persist → dedupe). For clerk this is byte-for-byte the old behavior
-// (503 unconfigured / 400 bad sig / 202 {received:true}); linking now happens in the drain's
-// clerkHandler. External id prefers svix-id (clerk/resend) then x-event-id / body.id.
+// inbox module (verify → persist → dedupe). The dedup id must come from a SIGNED source per
+// provider, never an unsigned header an attacker can vary to bypass replay dedup:
+//   clerk/resend -> svix-id (part of the Svix-signed set); avenia -> event.id (inside the
+//   PSS-signed body). Unsigned x-event-id is only a last-resort for providers with no scheme.
 async function handleWebhook(req: Request, res: Response, provider: string): Promise<void> {
   const body = (req.body ?? {}) as { id?: unknown; type?: unknown; eventId?: unknown; eventType?: unknown };
   // Avenia wraps everything: { event: { id, data: { type, ticket } } } (observed live 2026-07-07).
   const avenia = (req.body as { event?: { id?: unknown; data?: { type?: unknown } } } | null)?.event;
   const externalId = String(
-    req.header("svix-id") ?? req.header("x-event-id") ?? body.id ?? body.eventId ?? avenia?.id ?? randomUUID(),
+    provider === "avenia"
+      ? (avenia?.id ?? randomUUID())
+      : (req.header("svix-id") ?? req.header("x-event-id") ?? body.id ?? body.eventId ?? randomUUID()),
   );
   const outcome = await receiveWebhook({
     provider,
@@ -572,9 +575,16 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     res.status(503).json({ error: "temporarily_unavailable" });
     return;
   }
-  const status =
-    err instanceof Error && "statusCode" in err ? Number((err as { statusCode: unknown }).statusCode) || 500 : 500;
-  res.status(status).json({ error: err instanceof Error ? err.message : "internal_error" });
+  // HttpError carries a curated, safe message (our own codes). ANY other error (pg, thrown
+  // Error, syntax) is logged server-side and returned as a NEUTRAL body — never echo raw
+  // messages (constraint/column names, "cannot convert to BigInt") to the client.
+  if (err instanceof Error && "statusCode" in err) {
+    const status = Number((err as { statusCode: unknown }).statusCode) || 500;
+    res.status(status).json({ error: err.message });
+    return;
+  }
+  console.warn("unhandled_error", JSON.stringify({ message: err instanceof Error ? err.message : String(err) }));
+  res.status(500).json({ error: "internal_error" });
 });
 
 // Entry side-effects. Guarded so importing `app` in tests (routeClassRegistry walks the

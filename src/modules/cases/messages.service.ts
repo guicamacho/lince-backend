@@ -58,6 +58,7 @@ export async function postAdminCaseMessageOn(
   if (!UUID_RE.test(input.caseId)) throw new HttpError("case_not_found", 404);
   const body = String(input.body ?? "").trim();
   if (!body) throw new HttpError("empty_body", 400);
+  if (body.length > 5000) throw new HttpError("body_too_long", 422);
   const requested = input.customerVisible === true;
 
   {

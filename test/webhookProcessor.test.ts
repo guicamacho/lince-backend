@@ -114,6 +114,16 @@ test("receiveWebhook dedupes on (provider, external_event_id)", async () => {
   assert.equal(rowCount, 1);
 });
 
+test("receiveWebhook rejects an unknown provider (404) and stores NOTHING (anti-DoS)", async () => {
+  const res = await receiveWebhook({
+    provider: "attacker",
+    externalId: "x", eventType: "x", rawBody: "{}", payload: { big: "x".repeat(1000) }, headers: {}, config: {},
+  });
+  assert.equal(res.status, 404);
+  const { rowCount } = await pool.query("select 1 from webhook_events where provider_code = 'attacker'");
+  assert.equal(rowCount, 0);
+});
+
 test("receiveWebhook rejects an unverified Svix provider with 400 and stores nothing", async () => {
   const res = await receiveWebhook({
     provider: "clerk",
