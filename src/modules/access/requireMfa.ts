@@ -35,6 +35,11 @@ export function mfaDecision(
   return "ok";
 }
 
+/** fva = [firstFactorAge, secondFactorAge]; secondFactorAge === -1 => no 2FA verified. */
+export function hasSecondFactor(fva: unknown): boolean {
+  return Array.isArray(fva) && fva[1] !== -1 && fva[1] !== undefined;
+}
+
 /**
  * Express middleware. `policy` defaults to the MFA_POLICY env flag (only exactly
  * "mandatory" flips it — the ruling default is optional); Wave 2 passes env.mfa.policy
@@ -45,10 +50,7 @@ export function requireMfa(
 ) {
   return (req: Request, res: Response, next: NextFunction): void => {
     const { userId, sessionClaims } = getAuth(req);
-    // fva = [firstFactorAge, secondFactorAge]; secondFactorAge === -1 => no 2FA verified.
-    const fva = sessionClaims?.fva;
-    const secondFactorPresent = fva !== undefined && fva[1] !== -1;
-    switch (mfaDecision(policy, userId, secondFactorPresent)) {
+    switch (mfaDecision(policy, userId, hasSecondFactor(sessionClaims?.fva))) {
       case "unauthenticated":
         res.status(401).json({ error: "unauthenticated" });
         return;
@@ -58,5 +60,27 @@ export function requireMfa(
       default:
         next();
     }
+  };
+}
+
+/**
+ * Always require an enrolled second factor, independent of the global (optional) MFA policy.
+ * Used on the payee/money-out surface: adding a beneficiary requires 2FA — the first payee
+ * is the enrollment trigger (PRD-02 F4 money-out hardening; product decision 2026-07-10).
+ * Not a step-up re-challenge: presence of the second factor persists once enrolled, so
+ * later payees pass without friction. requireStepUp handles fresh re-verification separately.
+ */
+export function requireSecondFactor() {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const { userId, sessionClaims } = getAuth(req);
+    if (!userId) {
+      res.status(401).json({ error: "unauthenticated" });
+      return;
+    }
+    if (!hasSecondFactor(sessionClaims?.fva)) {
+      res.status(403).json({ error: "mfa_required", action: "enrol" });
+      return;
+    }
+    next();
   };
 }

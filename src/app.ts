@@ -42,7 +42,7 @@ import { createDeposit, listTransactionsForOrg, reconcileInFlightDeposits } from
 import { balancesForOrg } from "./modules/ledger/ledger.service.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { requireStepUp } from "./modules/access/requireStepUp.js";
-import { requireMfa } from "./modules/access/requireMfa.js";
+import { requireSecondFactor } from "./modules/access/requireMfa.js";
 import { rateLimit } from "./modules/ratelimit/middleware.js";
 import { receiveWebhook } from "./modules/webhooks/inbox.js";
 import { aveniaWebhookPublicKey } from "./modules/webhooks/aveniaKey.js";
@@ -294,7 +294,9 @@ app.post(
   "/app/beneficiaries",
   rateLimit("beneficiary_write"),
   requireStepUp(env.stepUp.enforced),
-  requireMfa(env.mfa.policy),
+  // Payees are the money-out surface: 2FA is ALWAYS required here (the global MFA policy
+  // stays optional elsewhere). The first payee is the enrollment trigger.
+  requireSecondFactor(),
   async (req: Request, res: Response) => {
     const { userId } = getAuth(req);
     res.json(await createBeneficiaryForOrg(res.locals.orgId, userId, (req.body ?? {}) as Record<string, unknown>));
