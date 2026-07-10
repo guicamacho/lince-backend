@@ -59,9 +59,9 @@ test("customer replies to the RFI thread pre-active (closes the loop)", async ()
 test("raiseRfi refuses illegal source states (only vendor_pending / kyb_in_progress / rfi_required)", async () => {
   const admin = await createAdmin();
   const active = await createOrg("active");
-  await assert.rejects(() => raiseRfi({ orgId: active, adminId: admin, message: "x" }), /illegal|transition/i);
+  await assert.rejects(() => raiseRfi({ orgId: active, adminId: admin, message: "x" }), /org_state_not_eligible_for_rfi/);
   const pending = await createOrg("pending_lince_approval", "11222333000199");
-  await assert.rejects(() => raiseRfi({ orgId: pending, adminId: admin, message: "x" }), /illegal|transition/i);
+  await assert.rejects(() => raiseRfi({ orgId: pending, adminId: admin, message: "x" }), /org_state_not_eligible_for_rfi/);
 });
 
 test("no open RFI -> empty thread (not an error)", async () => {

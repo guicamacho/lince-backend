@@ -16,7 +16,7 @@
  */
 import { withTransaction } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
-import { assertTransition, type OrgState } from "../identity/org.state.js";
+import { canTransition, type OrgState } from "../identity/org.state.js";
 import { postAdminCaseMessageOn } from "../cases/messages.service.js";
 
 export interface RaiseRfiInput {
@@ -37,9 +37,12 @@ export async function raiseRfi(input: RaiseRfiInput): Promise<{ caseId: string; 
     const org = rows[0];
     if (!org) throw new HttpError("org_not_found", 404);
     // Already in RFI = a follow-up EDD round: append to the thread, no state change. Otherwise
-    // transition in (assertTransition rejects active/declined/rejected/pending sources).
+    // transition in — only vendor_pending / kyb_in_progress are eligible; anything else is a
+    // clean 409 (not a raw 500 from the bare assertTransition Error).
     if (org.state !== "rfi_required") {
-      assertTransition(org.state, "rfi_required");
+      if (!canTransition(org.state, "rfi_required")) {
+        throw new HttpError("org_state_not_eligible_for_rfi", 409);
+      }
       await c.query(`update orgs set state = 'rfi_required', updated_at = now() where id = $1`, [input.orgId]);
     }
 
