@@ -4,9 +4,9 @@
  * Dedupe is the DB constraint `unique (provider_code, external_event_id)` (0001) — a re-delivery
  * is an `on conflict do nothing`, never a second row. Processing is a separate concern (processor.ts).
  *
- * Signature-verified providers (clerk/resend/avenia) MUST pass or get a 400 (and a greppable
- * security warning for the log-drain alarm). Providers whose inbound scheme is unconfirmed
- * (didit) are stored ONLY — kept ready for the day the scheme lands, never processed as trusted.
+ * Every known provider (clerk/resend/avenia/didit) is signature-verified and MUST pass or get
+ * a 400 (and a greppable security warning for the log-drain alarm). There is no store-only
+ * tier: unauthenticated bodies are never persisted.
  *
  * Returns the HTTP status the route should send; the integrator delegates the route body here.
  */
@@ -42,6 +42,7 @@ export async function receiveWebhook(input: ReceiveInput): Promise<ReceiptOutcom
     const configured =
       provider === "clerk" ? !!config.clerkSecret
       : provider === "resend" ? !!config.resendSecret
+      : provider === "didit" ? !!config.diditSecret
       : !!config.aveniaPublicKey;
     if (!configured) return { status: 503, body: { error: "webhook_not_configured" } };
     if (!(await verifyWebhook(provider, rawBody, headers, config)).ok) {

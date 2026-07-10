@@ -28,6 +28,7 @@
  * regulated PII. Money flows (Avenia) + real Didit are stubbed.
  */
 import { randomUUID } from "node:crypto";
+import { HttpError } from "./http/error.js";
 import express, { type Request, type Response, type NextFunction } from "express";
 import { env } from "./config/env.js";
 import { clerkMiddleware, getAuth } from "@clerk/express";
@@ -102,6 +103,7 @@ const webhookVerifierConfig = {
   clerkSecret: env.clerk.webhookSigningSecret,
   resendSecret: env.webhooks.resendSecret,
   aveniaPublicKey: aveniaWebhookPublicKey,
+  diditSecret: env.didit.webhookSecret,
 };
 
 // Shared webhook route body: build the receipt input from the request and delegate to the
@@ -113,10 +115,12 @@ async function handleWebhook(req: Request, res: Response, provider: string): Pro
   const body = (req.body ?? {}) as { id?: unknown; type?: unknown; eventId?: unknown; eventType?: unknown };
   // Avenia wraps everything: { event: { id, data: { type, ticket } } } (observed live 2026-07-07).
   const avenia = (req.body as { event?: { id?: unknown; data?: { type?: unknown } } } | null)?.event;
+  // Signed sources first: svix-id (Svix-signed set), then body ids (inside an HMAC/PSS-signed
+  // body). The unsigned x-event-id header is a last resort only — never let it shadow a signed id.
   const externalId = String(
     provider === "avenia"
       ? (avenia?.id ?? randomUUID())
-      : (req.header("svix-id") ?? req.header("x-event-id") ?? body.id ?? body.eventId ?? randomUUID()),
+      : (req.header("svix-id") ?? body.id ?? body.eventId ?? req.header("x-event-id") ?? randomUUID()),
   );
   const outcome = await receiveWebhook({
     provider,
@@ -129,6 +133,7 @@ async function handleWebhook(req: Request, res: Response, provider: string): Pro
       "svix-timestamp": req.header("svix-timestamp"),
       "svix-signature": req.header("svix-signature"),
       signature: req.header("signature"), // Avenia: base64 RSA-PSS over the raw body
+      "x-signature": req.header("x-signature"), // Didit: hex HMAC-SHA256 over the raw body
     },
     config: webhookVerifierConfig,
     clientIp: req.ip,
@@ -581,9 +586,15 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   // HttpError carries a curated, safe message (our own codes). ANY other error (pg, thrown
   // Error, syntax) is logged server-side and returned as a NEUTRAL body — never echo raw
   // messages (constraint/column names, "cannot convert to BigInt") to the client.
-  if (err instanceof Error && "statusCode" in err) {
-    const status = Number((err as { statusCode: unknown }).statusCode) || 500;
-    res.status(status).json({ error: err.message });
+  if (err instanceof HttpError) {
+    res.status(err.statusCode).json({ error: err.message });
+    return;
+  }
+  // Framework 4xx (body-parser's malformed-JSON 400 / oversized 413 are http-errors that also
+  // carry statusCode): keep the status, neutralize the message — parser internals stay server-side.
+  const fwStatus = err instanceof Error && "statusCode" in err ? Number((err as { statusCode: unknown }).statusCode) : NaN;
+  if (fwStatus >= 400 && fwStatus < 500) {
+    res.status(fwStatus).json({ error: "bad_request" });
     return;
   }
   console.warn("unhandled_error", JSON.stringify({ message: err instanceof Error ? err.message : String(err) }));

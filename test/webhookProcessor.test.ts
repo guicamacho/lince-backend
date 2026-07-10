@@ -1,6 +1,7 @@
 /** Webhook drain: retry accounting, dead-lettering, poison isolation, replay, and receipt dedupe. */
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { pool } from "../src/db/pool.js";
 import { drainWebhooks, replayWebhookEvent, type WebhookHandler } from "../src/modules/webhooks/processor.js";
 import { receiveWebhook } from "../src/modules/webhooks/inbox.js";
@@ -95,16 +96,18 @@ test("replay resets a dead row so the drain re-picks and processes it", async ()
 });
 
 test("receiveWebhook dedupes on (provider, external_event_id)", async () => {
-  // didit = still store-only (scheme unconfirmed); avenia is signature-verified since the
-  // PSS scheme landed, so it no longer works as the store-only example here.
+  // didit is HMAC-verified since 2026-07-11 — no store-only tier remains, so the dedup
+  // example signs its body like a real Didit delivery.
+  const secret = "didit-test-secret";
+  const rawBody = JSON.stringify({ id: "dup-1" });
   const input = {
     provider: "didit",
     externalId: "dup-1",
     eventType: "verification.updated",
-    rawBody: "{}",
+    rawBody,
     payload: { id: "dup-1" },
-    headers: {},
-    config: {},
+    headers: { "x-signature": createHmac("sha256", secret).update(rawBody).digest("hex") },
+    config: { diditSecret: secret },
   };
   assert.equal((await receiveWebhook(input)).status, 202);
   assert.equal((await receiveWebhook(input)).status, 202);
@@ -112,6 +115,20 @@ test("receiveWebhook dedupes on (provider, external_event_id)", async () => {
     "select 1 from webhook_events where provider_code = 'didit' and external_event_id = 'dup-1'",
   );
   assert.equal(rowCount, 1);
+});
+
+test("didit without a valid HMAC is rejected and stores nothing (no store-only tier)", async () => {
+  const base = { provider: "didit", externalId: "d1", eventType: "x", rawBody: "{}", payload: {} };
+  // wrong/missing signature -> 400
+  const bad = await receiveWebhook({ ...base, headers: { "x-signature": "00".repeat(32) }, config: { diditSecret: "s" } });
+  assert.equal(bad.status, 400);
+  const missing = await receiveWebhook({ ...base, headers: {}, config: { diditSecret: "s" } });
+  assert.equal(missing.status, 400);
+  // secret not configured -> 503, still nothing stored
+  const unconfigured = await receiveWebhook({ ...base, headers: {}, config: {} });
+  assert.equal(unconfigured.status, 503);
+  const { rowCount } = await pool.query("select 1 from webhook_events where provider_code = 'didit'");
+  assert.equal(rowCount, 0);
 });
 
 test("receiveWebhook rejects an unknown provider (404) and stores NOTHING (anti-DoS)", async () => {

@@ -9,13 +9,14 @@
  * (integration guide: Webhooks/verifyingWebhookAuthenticity). NOTE this differs from
  * Avenia's OUTBOUND request signing (PKCS#1 v1.5) — do not reuse the request signer.
  *
- * Didit stays a STUB (payloads unconfirmed): its verifier returns `{ ok: false }` so it is
- * never treated as signature-verified.
+ * Didit signs with HMAC-SHA256 over the RAW body (hex in `x-signature`), keyed by the
+ * dashboard webhook secret (docs.didit.me → Webhooks). Verified here so /webhooks/didit is
+ * never an unauthenticated unbounded-insert vector (verification sweep, 2026-07-11).
  *
  * Secrets/keys are passed in (VerifierConfig); the integrator wires env + fetchers in app.ts.
  */
 import { Webhook } from "svix";
-import { createPublicKey, verify as cryptoVerify, constants } from "node:crypto";
+import { createPublicKey, verify as cryptoVerify, constants, createHmac, timingSafeEqual } from "node:crypto";
 
 export type VerifyResult = { ok: true; event: unknown } | { ok: false };
 
@@ -26,14 +27,16 @@ export interface VerifierConfig {
   resendSecret?: string;
   /** Resolves Avenia's webhook public key PEM (GET /v2/public-key); caller caches. */
   aveniaPublicKey?: () => Promise<string | null>;
+  diditSecret?: string;
 }
 
 /** Providers verified via Svix. */
 export const SVIX_PROVIDERS = new Set(["clerk", "resend"]);
 /** Providers with a CONFIRMED inbound scheme — signature required at intake. */
-export const VERIFIED_PROVIDERS = new Set(["clerk", "resend", "avenia"]);
+export const VERIFIED_PROVIDERS = new Set(["clerk", "resend", "avenia", "didit"]);
 /** Every provider the intake will accept. Anything else is rejected (no unbounded storage of
- *  unauthenticated junk). didit is known but store-only (scheme unconfirmed). */
+ *  unauthenticated junk). Every known provider is now signature-verified — a new store-only
+ *  provider must NOT be added here without a scheme (that re-opens the unbounded-insert hole). */
 export const KNOWN_PROVIDERS = new Set(["clerk", "resend", "avenia", "didit"]);
 
 function verifySvix(secret: string, rawBody: string, headers: WebhookHeaders): VerifyResult {
@@ -85,8 +88,24 @@ export async function verifyWebhook(
       if (!pem) return { ok: false };
       return verifyAveniaPss(pem, rawBody, signature) ? { ok: true, event: rawBody } : { ok: false };
     }
+    case "didit": {
+      const signature = headers["x-signature"];
+      if (!signature || !config.diditSecret) return { ok: false };
+      return verifyDiditHmac(config.diditSecret, rawBody, signature) ? { ok: true, event: rawBody } : { ok: false };
+    }
     default:
-      // didit / unknown — no confirmed inbound scheme; never claim verified.
+      // unknown — no confirmed inbound scheme; never claim verified.
       return { ok: false };
+  }
+}
+
+/** HMAC-SHA256 hex over the raw body; constant-time compare. */
+function verifyDiditHmac(secret: string, rawBody: string, signatureHex: string): boolean {
+  try {
+    const expected = createHmac("sha256", secret).update(rawBody, "utf8").digest();
+    const given = Buffer.from(signatureHex, "hex");
+    return given.length === expected.length && timingSafeEqual(given, expected);
+  } catch {
+    return false;
   }
 }

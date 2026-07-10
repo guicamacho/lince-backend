@@ -11,6 +11,8 @@ test("vendorMinor rounds extra decimals half-up, never throws", () => {
   assert.equal(vendorMinor("", "BRL"), 0n); // malformed -> 0, not a throw
   assert.equal(vendorMinor("not-a-number", "BRL"), 0n);
   assert.equal(vendorMinor("1e9", "BRL"), 0n); // scientific notation is not a plain decimal
+  // the CURRENCY is vendor-supplied too — an unmapped label degrades (2 dp), never throws
+  assert.equal(vendorMinor("1.5", "R$" as unknown as Parameters<typeof vendorMinor>[1]), 150n);
 });
 
 // parseCustomerAmount: strict; returns null on anything a customer shouldn't be able to submit.

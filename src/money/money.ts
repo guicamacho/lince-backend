@@ -36,7 +36,9 @@ export function toMinor(amount: string, currency: Currency): bigint {
  * BRLA the remainder is lost — widen DECIMALS.BRLA when that becomes real.
  */
 export function vendorMinor(amount: string, currency: Currency): bigint {
-  const dp = DECIMALS[currency];
+  // The currency is ALSO vendor-supplied (fee rows arrive as free strings cast to Currency):
+  // an unmapped label must degrade like a bad amount does, never throw. 2 dp = the map's mode.
+  const dp = DECIMALS[currency] ?? 2;
   const m = /^(-?)(\d+)(?:\.(\d+))?$/.exec(String(amount ?? "").trim());
   if (!m) return 0n;
   const sign = m[1];

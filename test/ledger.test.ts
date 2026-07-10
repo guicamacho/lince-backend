@@ -1,7 +1,7 @@
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { pool, withTransaction } from "../src/db/pool.js";
-import { postBalancedTransaction, balanceOf } from "../src/modules/ledger/ledger.service.js";
+import { postBalancedTransaction, postBalancedTransactionOn, balanceOf } from "../src/modules/ledger/ledger.service.js";
 import { DuplicateLedgerPostError } from "../src/modules/ledger/ledger.types.js";
 import { resetDb, createLedgerAccount } from "./helpers.js";
 
@@ -23,6 +23,28 @@ test("idempotencyKey backstop: a second post with the same key throws, no double
   await post();
   await assert.rejects(post, (e) => e instanceof DuplicateLedgerPostError);
   assert.equal(await balanceOf(b, "BRL"), 10_000n); // credited exactly once
+});
+
+test("a swallowed duplicate leaves the surrounding transaction usable (savepoint)", async () => {
+  const a = await createLedgerAccount(null, "BRL", "customer_liability");
+  const b = await createLedgerAccount(null, "BRL", "vendor_asset");
+  const input = {
+    description: "settle",
+    idempotencyKey: "deposit-settle:tx-2",
+    postings: [
+      { accountId: a, amount: -10_000n, currency: "BRL" as const },
+      { accountId: b, amount: 10_000n, currency: "BRL" as const },
+    ],
+  };
+  await postBalancedTransaction(input); // first settle commits
+  // Second attempt inside a bigger unit of work (ticketApply's shape): the caller swallows
+  // the duplicate and MUST be able to keep using the same client — 25P02 without the savepoint.
+  await withTransaction(async (c) => {
+    await assert.rejects(() => postBalancedTransactionOn(c, input), (e) => e instanceof DuplicateLedgerPostError);
+    const { rows } = await c.query<{ ok: number }>("select 1 as ok");
+    assert.equal(rows[0]!.ok, 1);
+  });
+  assert.equal(await balanceOf(b, "BRL"), 10_000n); // still exactly once
 });
 
 test("balanced commit; balance = SUM(postings)", async () => {

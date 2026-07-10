@@ -32,6 +32,11 @@ export async function postBalancedTransactionOn(
   input: PostBalancedTransactionInput,
 ): Promise<string> {
   assertBalancedPerCurrency(input);
+  // The keyed insert runs under a SAVEPOINT: a 23505 aborts the pg transaction until rolled
+  // back, and callers that swallow DuplicateLedgerPostError (ticketApply) must be able to keep
+  // using this client — without the savepoint every later statement dies with 25P02.
+  const keyed = !!input.idempotencyKey;
+  if (keyed) await client.query("savepoint ledger_post");
   let rows: { id: string }[];
   try {
     ({ rows } = await client.query<{ id: string }>(
@@ -40,11 +45,13 @@ export async function postBalancedTransactionOn(
     ));
   } catch (e) {
     // Exactly-once backstop: a second post with the same idempotency_key hits ledger_tx_idempotency_uq.
-    if (input.idempotencyKey && (e as { code?: string }).code === "23505") {
-      throw new DuplicateLedgerPostError(input.idempotencyKey);
+    if (keyed && (e as { code?: string }).code === "23505") {
+      await client.query("rollback to savepoint ledger_post");
+      throw new DuplicateLedgerPostError(input.idempotencyKey!);
     }
     throw e;
   }
+  if (keyed) await client.query("release savepoint ledger_post");
   const ledgerTxId = rows[0]!.id;
   for (const p of input.postings) {
     await client.query(
