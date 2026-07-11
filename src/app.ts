@@ -37,6 +37,7 @@ import { activeMembershipForClerkUser } from "./modules/access/orgContext.js";
 import { requirePermission, accessRoles } from "./modules/access/permissions.js";
 import { listMembers, inviteMember, resendInvitation, changeMemberRole, removeMember, transferOwnership } from "./modules/team/team.service.js";
 import { sendFreshInvitation, revokeInvitationsFor } from "./modules/team/clerkInvitations.js";
+import { ensureClerkUserLinked } from "./modules/identity/clerkSync.js";
 import { setOrgAccess } from "./modules/access/access.service.js";
 import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
@@ -160,7 +161,14 @@ app.post("/onboarding/bootstrap", rateLimit("signup_start"), async (req: Request
 app.get("/onboarding/state", rateLimit("reads"), async (req: Request, res: Response) => {
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
-  res.json(await currentOrgForClerkUser(uid));
+  let org = await currentOrgForClerkUser(uid);
+  if (!org) {
+    // Invited-signup fallback: the user.created webhook may lag (or never reach a local
+    // backend) — link by verified email now so an invitee lands in their org, not onboarding.
+    await ensureClerkUserLinked(uid);
+    org = await currentOrgForClerkUser(uid);
+  }
+  res.json(org);
 });
 
 // "Start verification": Avenia COMPANY subaccount first (Connectivity §3 — KYB runs
@@ -251,7 +259,12 @@ app.use("/app", async (req: Request, res: Response, next: NextFunction) => {
     res.status(401).json({ error: "unauthenticated" });
     return;
   }
-  const membership = await activeMembershipForClerkUser(userId);
+  let membership = await activeMembershipForClerkUser(userId);
+  if (!membership) {
+    // Invited-signup fallback (see /onboarding/state): link-on-login, then retry once.
+    await ensureClerkUserLinked(userId);
+    membership = await activeMembershipForClerkUser(userId);
+  }
   if (!membership) {
     res.status(403).json({ error: "no_active_org" });
     return;

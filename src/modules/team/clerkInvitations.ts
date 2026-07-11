@@ -17,7 +17,13 @@ const authHeaders = () => ({
   Authorization: `Bearer ${env.clerk.secretKey ?? ""}`,
   "Content-Type": "application/json",
 });
-const redirectUrl = () => (env.customerAppUrl ? `${env.customerAppUrl}/sign-up` : undefined);
+/** The invite email deep-links to /sign-up?invited=<email>: the ticket JWT carries no email, so
+ *  the query param is how the sign-up page shows "Convite para <email>" as a UI reference
+ *  (display-only; Clerk binds the actual signup email to the ticket regardless). */
+export function inviteRedirectUrl(base: string, email: string): string {
+  return `${base}/sign-up?invited=${encodeURIComponent(email)}`;
+}
+const redirectUrl = (email: string) => (env.customerAppUrl ? inviteRedirectUrl(env.customerAppUrl, email) : undefined);
 
 /**
  * Should a failed Clerk create be treated as "a pending invitation already exists" (recreatable)
@@ -32,7 +38,7 @@ export function isDuplicateInvitation(status: number, body: unknown): boolean {
 
 async function createInvitation(email: string): Promise<Response> {
   const payload: Record<string, string> = { email_address: email };
-  const r = redirectUrl();
+  const r = redirectUrl(email);
   if (r) payload.redirect_url = r;
   return fetch(API, { method: "POST", headers: authHeaders(), body: JSON.stringify(payload) });
 }

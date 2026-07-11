@@ -2,7 +2,7 @@
  * Sync a Clerk user into a `people` row (operational identity ONLY — Modelo A: no KYC PII).
  * Driven by the signature-verified Clerk webhook (user.created / user.updated). Idempotent.
  */
-import { withTransaction } from "../../db/pool.js";
+import { pool, withTransaction } from "../../db/pool.js";
 
 export interface ClerkUserEvent {
   type: string;
@@ -67,4 +67,35 @@ export async function linkClerkUserFromEvent(event: ClerkUserEvent): Promise<str
     );
     return created.rows[0]!.id;
   });
+}
+
+/** Raw Clerk user fetch, shaped like the webhook payload (raw API — the SDK drops fields). */
+async function fetchClerkUser(userId: string): Promise<ClerkUserEvent["data"] | null> {
+  const res = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`, {
+    headers: { Authorization: `Bearer ${process.env.CLERK_SECRET_KEY ?? ""}` },
+  });
+  if (!res.ok) return null;
+  return (await res.json()) as ClerkUserEvent["data"];
+}
+
+/**
+ * Link-on-login fallback. The invited→active flip normally rides the Clerk user.created
+ * webhook, but webhooks point at the DEPLOYED backend (never a local one) and can race the
+ * invitee's very first request in any environment. When a session's clerk_user_id has no
+ * people row, resolve the user from Clerk and run the SAME linking the webhook would.
+ * Idempotent; one indexed SELECT when already linked; best-effort (a Clerk outage falls
+ * through to the caller's normal no-org handling). `fetchUser` injectable for tests.
+ */
+export async function ensureClerkUserLinked(
+  clerkUserId: string,
+  fetchUser: (id: string) => Promise<ClerkUserEvent["data"] | null> = fetchClerkUser,
+): Promise<void> {
+  const { rows } = await pool.query("select 1 from people where clerk_user_id = $1", [clerkUserId]);
+  if (rows[0]) return;
+  try {
+    const data = await fetchUser(clerkUserId);
+    if (data) await linkClerkUserFromEvent({ type: "user.created", data: { ...data, id: clerkUserId } });
+  } catch {
+    /* best-effort — the webhook remains the durable path */
+  }
 }

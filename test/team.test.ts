@@ -14,7 +14,8 @@ import {
 } from "../src/modules/team/team.service.js";
 import { isDuplicateInvitation } from "../src/modules/team/clerkInvitations.js";
 import { activeMembershipForClerkUser } from "../src/modules/access/orgContext.js";
-import { linkClerkUserFromEvent } from "../src/modules/identity/clerkSync.js";
+import { linkClerkUserFromEvent, ensureClerkUserLinked } from "../src/modules/identity/clerkSync.js";
+import { inviteRedirectUrl } from "../src/modules/team/clerkInvitations.js";
 import { HttpError } from "../src/http/error.js";
 
 beforeEach(resetDb);
@@ -314,6 +315,38 @@ test("gate resolver: invited/suspended memberships do not resolve; active does, 
   assert.deepEqual(membership?.roles, ["finance"]);
   await pool.query(`update org_people set status = 'suspended' where person_id = $1`, [invited]);
   assert.equal(await activeMembershipForClerkUser("clerk_inv"), null);
+});
+
+test("ensureClerkUserLinked: link-on-login flips an invited member without the webhook", async () => {
+  const { orgId } = await activeOrgWithOwner();
+  const invitee = await makePerson("late@t.test"); // invited: no clerk_user_id yet
+  await addMembership(orgId, invitee, ["viewer"], "invited");
+  // webhook never arrived; the fallback resolves the user from Clerk (injected) and links
+  await ensureClerkUserLinked("clerk_late", async () => ({
+    id: "clerk_late",
+    email_addresses: [{ id: "e1", email_address: "late@t.test" }],
+    primary_email_address_id: "e1",
+    first_name: "Leo",
+    last_name: "Lima",
+  }));
+  const m = await activeMembershipForClerkUser("clerk_late");
+  assert.equal(m?.orgId, orgId);
+  assert.deepEqual(m?.roles, ["viewer"]);
+  // already linked -> no Clerk fetch (fetchUser throwing proves it isn't called)
+  await ensureClerkUserLinked("clerk_late", async () => {
+    throw new Error("must not fetch");
+  });
+  // a Clerk failure for an unknown user is swallowed (best-effort), not thrown
+  await ensureClerkUserLinked("clerk_ghost", async () => {
+    throw new Error("clerk down");
+  });
+});
+
+test("inviteRedirectUrl deep-links to /sign-up with the invited email as a UI reference", () => {
+  assert.equal(
+    inviteRedirectUrl("https://app.example", "a+b@t.test"),
+    "https://app.example/sign-up?invited=a%2Bb%40t.test",
+  );
 });
 
 test("clerkSync: accepted invitation links clerk_user_id and flips invited -> active", async () => {
