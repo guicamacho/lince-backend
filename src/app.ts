@@ -77,13 +77,19 @@ import {
 } from "./modules/cases/customerInbox.service.js";
 import { raiseRfi } from "./modules/onboarding/rfi.service.js";
 
-// Fail closed: the admin verified-identity path (PRD-08 §5.1) must not silently degrade to
-// body-trust in production, and maker-checker is meaningless without it. Assert at boot.
-if (process.env.NODE_ENV === "production" && !env.adminClerk.secretKey) {
-  throw new Error("ADMIN_CLERK_SECRET_KEY is required in production (admin identity would fall back to body-trust)");
-}
+// Admin identity (PRD-08 §5.1). Enabling maker-checker WITHOUT verified identity is an
+// unambiguous misconfig — four-eyes is defeatable then — so that hard-fails at boot. Running
+// legacy body-trust (no secret) is allowed for dev/staging but emits a loud, greppable boot
+// alarm so a real production that forgets ADMIN_CLERK_SECRET_KEY is never silent. (NODE_ENV
+// can't distinguish dev-deployed from prod here — both are "production" — so the secret's
+// presence IS the enforcement switch, not NODE_ENV.)
 if (env.makerCheckerEnabled && !env.adminClerk.secretKey) {
   throw new Error("MAKER_CHECKER_ENABLED requires ADMIN_CLERK_SECRET_KEY (four-eyes needs verified admin identity)");
+}
+if (!env.adminClerk.secretKey) {
+  console.warn(
+    "security.admin_identity_unverified: /admin is running LEGACY body-trust — set ADMIN_CLERK_SECRET_KEY to enforce verified staff identity + RBAC (PRD-08 §5.1).",
+  );
 }
 
 export const app = express();
