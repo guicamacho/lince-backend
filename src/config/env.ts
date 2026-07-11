@@ -23,6 +23,9 @@ export const env = {
     publishableKey: optional("CLERK_PUBLISHABLE_KEY"),
     webhookSigningSecret: optional("CLERK_WEBHOOK_SIGNING_SECRET"),
   },
+  // Public origin of the customer app (lince-customer). Used to point Clerk team-invitation
+  // emails at OUR /sign-up page instead of Clerk's hosted Account Portal. No trailing slash.
+  customerAppUrl: optional("CUSTOMER_APP_URL"),
   avenia: {
     baseUrl: optional("AVENIA_BASE_URL") ?? "https://api.sandbox.avenia.io:10952",
     apiKey: optional("AVENIA_API_KEY"),

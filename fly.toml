@@ -4,6 +4,7 @@ primary_region = "gru"
 [env]
   NODE_ENV = "production"
   PORT = "3000"
+  CUSTOMER_APP_URL = "https://lince-customer.fly.dev"
 
 # Private-only: this app has NO public service, so Fly allocates no public IPs and
 # *.fly.dev is dark. It is reached solely via the Cloudflare Tunnel over Fly's 6PN

@@ -327,10 +327,15 @@ app.post(
 /** Clerk invitation for a brand-new invitee; acceptance -> user.created webhook -> clerkSync
  *  links clerk_user_id + flips the membership invited->active. */
 async function sendClerkInvitation(email: string): Promise<void> {
+  // redirect_url lands the invitee on OUR Lince /sign-up page (with the __clerk_ticket appended,
+  // which <SignUp> consumes to pre-fill the email + accept the invite) instead of Clerk's hosted
+  // Account Portal. Omitted when unset -> Clerk's default portal (dev fallback).
+  const payload: Record<string, string> = { email_address: email };
+  if (env.customerAppUrl) payload.redirect_url = `${env.customerAppUrl}/sign-up`;
   const res = await fetch("https://api.clerk.com/v1/invitations", {
     method: "POST",
     headers: { Authorization: `Bearer ${env.clerk.secretKey ?? ""}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ email_address: email }),
+    body: JSON.stringify(payload),
   });
   if (res.ok) return;
   // A Clerk 4xx duplicate_record means an invitation for this email already exists and will be
