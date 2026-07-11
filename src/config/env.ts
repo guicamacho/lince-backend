@@ -35,6 +35,9 @@ export const env = {
   didit: {
     apiKey: optional("DIDIT_API_KEY"),
     webhookSecret: optional("DIDIT_WEBHOOK_SECRET"),
+    // Document submission uses the real Didit doc API only when exactly "true"; else mocked
+    // (stores a reference, never bytes, either way). Flip when the Didit integration lands.
+    documentsLive: process.env.DIDIT_DOCUMENTS_LIVE === "true",
   },
   // Step-up (re-auth) gate for sensitive mutations. Off unless exactly "true".
   stepUp: {

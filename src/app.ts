@@ -38,6 +38,8 @@ import { requirePermission, accessRoles } from "./modules/access/permissions.js"
 import { listMembers, inviteMember, resendInvitation, changeMemberRole, removeMember, transferOwnership } from "./modules/team/team.service.js";
 import { sendFreshInvitation, revokeInvitationsFor } from "./modules/team/clerkInvitations.js";
 import { ensureClerkUserLinked } from "./modules/identity/clerkSync.js";
+import { submitDocument, listDocumentsForCase, MAX_DOC_BYTES } from "./modules/documents/documents.service.js";
+import { MockDiditDocuments, DiditDocuments } from "./modules/providers/didit/documents.js";
 import { setOrgAccess } from "./modules/access/access.service.js";
 import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
@@ -89,6 +91,9 @@ app.use(express.json({
 app.use(clerkMiddleware());
 
 const mockKyb = new MockKybProvider();
+// Document submission is MOCKED until Didit's real doc API is confirmed (env flip when it lands).
+// Either way Lince stores only a reference, never the bytes.
+const diditDocuments = env.didit.documentsLive ? new DiditDocuments() : new MockDiditDocuments();
 
 // Resolve the caller's Clerk user id, or write a 401 and return null. Pre-active
 // onboarding routes need a session but NOT an active org (that's the /app gate).
@@ -406,6 +411,36 @@ app.post("/app/cases/:id/messages", rateLimit("beneficiary_write"), async (req: 
   );
 });
 
+// Document upload (EDD/RFI). No-retention: the raw bytes stream to Didit (mock) and only a
+// reference is stored — the file is never persisted. octet-stream body (the BFF forwards it);
+// express.raw parses just this route (global express.json skips non-json content-types). Filename
+// + content-type ride in headers. ponytail: 15mb in-memory buffer is fine for a mock scaffold;
+// switch to a streamed multipart parser if real Didit needs large files without buffering.
+app.get("/app/cases/:id/documents", rateLimit("reads"), async (req: Request, res: Response) => {
+  // ORG-SCOPED: pass res.locals.orgId so a caller can only read their own org's case documents.
+  res.json({ documents: await listDocumentsForCase(res.locals.orgId, String(req.params.id)) });
+});
+
+app.post(
+  "/app/cases/:id/documents",
+  rateLimit("beneficiary_write"),
+  express.raw({ type: "application/octet-stream", limit: MAX_DOC_BYTES }),
+  async (req: Request, res: Response) => {
+    const doc = await submitDocument(
+      {
+        orgId: res.locals.orgId,
+        caseId: String(req.params.id),
+        uploadedByPersonId: res.locals.personId ?? null,
+        filename: decodeURIComponent(req.header("x-filename") ?? "documento"),
+        contentType: req.header("x-content-type") ?? "application/octet-stream",
+        content: Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0),
+      },
+      diditDocuments,
+    );
+    res.status(201).json(doc);
+  },
+);
+
 // --- Admin (internal) — service-token gated; the admin app authenticates staff via
 //     its own (separate) Clerk instance, then calls these server-to-server. ---
 app.get("/admin/orgs", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
@@ -446,6 +481,17 @@ app.get("/admin/transactions", rateLimit("admin_export"), requireAdminServiceTok
       createdAt: r.created_at,
     })),
   });
+});
+
+// Uploaded document references for an org (ops visibility; NO bytes exist to serve). Ops uses
+// these to know a customer provided EDD docs, then forwards to Avenia manually.
+app.get("/admin/orgs/:id/documents", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { rows } = await pool.query(
+    `select d.id, d.filename, d.content_type, d.size_bytes, d.status, d.didit_ref, d.created_at, d.case_id
+       from document_uploads d where d.org_id = $1 order by d.created_at desc limit 200`,
+    [String(req.params.id)],
+  );
+  res.json({ documents: rows });
 });
 
 // Events & Webhooks health (PRD-04 §4.8): processing status across providers. Failures are the

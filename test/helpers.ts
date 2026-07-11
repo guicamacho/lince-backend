@@ -5,7 +5,7 @@ import { pool } from "../src/db/pool.js";
 // provider_currencies) are intentionally NOT truncated.
 const DATA_TABLES = [
   "recon_breaks", "recon_runs", "notification_outbox", "rate_limits",
-  "audit_log", "cnpj_denylist", "webhook_events",
+  "document_uploads", "audit_log", "cnpj_denylist", "webhook_events",
   "customer_notifications", "case_messages", "cases",
   "ledger_postings", "ledger_transactions", "ledger_accounts", "org_transactions",
   "avenia_beneficiaries", "didit_verifications", "avenia_accounts",
