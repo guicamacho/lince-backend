@@ -55,6 +55,17 @@ test("listMembers: owner first, KYB tags hidden, pure-KYB rows excluded", async 
   assert.deepEqual(members[0]!.roles, ["owner"]); // legal_rep never surfaced
 });
 
+test("listMembers: cooldownRemaining reflects last_invited_at (0 when never invited)", async () => {
+  const { orgId, ownerId } = await activeOrgWithOwner();
+  const fresh = await makePerson("fresh@t.test");
+  await addMembership(orgId, fresh, ["viewer"], "invited"); // no last_invited_at
+  await inviteMember(orgId, ownerId, { email: "just@t.test", role: "viewer" }, noInvite); // sets last_invited_at now
+  const byId = Object.fromEntries((await listMembers(orgId)).map((m) => [m.email, m.cooldownRemaining]));
+  assert.equal(byId["fresh@t.test"], 0);
+  assert.ok(byId["just@t.test"] > 0 && byId["just@t.test"] <= INVITE_COOLDOWN_SECONDS);
+  assert.equal(byId[/* owner */ Object.keys(byId).find((e) => e.startsWith("owner"))!], 0);
+});
+
 test("invite: new email -> person + invited membership + Clerk invitation + audit", async () => {
   const { orgId, ownerId } = await activeOrgWithOwner();
   const sent: string[] = [];

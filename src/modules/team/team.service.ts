@@ -31,18 +31,25 @@ export interface TeamMember {
   /** Access roles only — KYB tags are never surfaced (PRD-03 §5). */
   roles: AccessRole[];
   status: "invited" | "active" | "suspended";
+  /** Seconds until this person can be (re)invited again — lets the UI grey the Reenviar button
+   *  with a countdown from page load, not only after a click. 0 when the cooldown has elapsed. */
+  cooldownRemaining: number;
 }
 
 export async function listMembers(orgId: string): Promise<TeamMember[]> {
   const { rows } = await pool.query<{
     person_id: string; full_name: string; email: string; roles: string[]; status: TeamMember["status"];
+    cooldown_remaining: number;
   }>(
-    `select op.person_id, p.full_name, p.email, op.roles, op.status
+    `select op.person_id, p.full_name, p.email, op.roles, op.status,
+            case when p.last_invited_at is null then 0
+                 else greatest(0, $2 - floor(extract(epoch from (now() - p.last_invited_at))))::int
+            end as cooldown_remaining
        from org_people op
        join people p on p.id = op.person_id
       where op.org_id = $1
       order by ('owner' = any(op.roles)) desc, op.created_at asc`,
-    [orgId],
+    [orgId, INVITE_COOLDOWN_SECONDS],
   );
   return rows
     .map((r) => ({
@@ -51,6 +58,7 @@ export async function listMembers(orgId: string): Promise<TeamMember[]> {
       email: r.email,
       roles: accessRoles(r.roles),
       status: r.status,
+      cooldownRemaining: r.cooldown_remaining,
     }))
     // ponytail: pure-KYB rows (non-login UBOs, no access role) are compliance records, not
     // team members — hide them from the Team screen.
@@ -185,7 +193,15 @@ export async function inviteMember(
       throw new HttpError("invite_delivery_failed", 502);
     }
   }
-  return { personId: created.personId, name: created.name, email: created.email, roles: created.roles, status: created.status };
+  return {
+    personId: created.personId,
+    name: created.name,
+    email: created.email,
+    roles: created.roles,
+    status: created.status,
+    // a just-invited member is mid-cooldown; an already-active (multi-org) one never emailed
+    cooldownRemaining: created.needsClerkInvitation ? INVITE_COOLDOWN_SECONDS : 0,
+  };
 }
 
 /**
