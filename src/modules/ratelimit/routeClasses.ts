@@ -66,6 +66,7 @@ export const ROUTE_CLASSMAP: Record<string, RouteClass> = {
   "POST /app/beneficiaries": "beneficiary_write",
   "GET /app/team": "reads",
   "POST /app/team/invitations": "beneficiary_write",
+  "POST /app/team/members/:personId/resend": "beneficiary_write",
   "POST /app/team/members/:personId/role": "beneficiary_write",
   "DELETE /app/team/members/:personId": "beneficiary_write",
   "POST /app/team/transfer-ownership": "beneficiary_write",

@@ -35,7 +35,8 @@ import { clerkMiddleware, getAuth } from "@clerk/express";
 import { pool } from "./db/pool.js";
 import { activeMembershipForClerkUser } from "./modules/access/orgContext.js";
 import { requirePermission, accessRoles } from "./modules/access/permissions.js";
-import { listMembers, inviteMember, changeMemberRole, removeMember, transferOwnership, isDuplicateInvitation } from "./modules/team/team.service.js";
+import { listMembers, inviteMember, resendInvitation, changeMemberRole, removeMember, transferOwnership } from "./modules/team/team.service.js";
+import { sendFreshInvitation, revokeInvitationsFor } from "./modules/team/clerkInvitations.js";
 import { setOrgAccess } from "./modules/access/access.service.js";
 import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
@@ -324,36 +325,20 @@ app.post(
 // --- Team (PRD-03 F1/F3/F7). requirePermission is the WHO gate (owner/admin); the service
 //     enforces WHAT is legal (owner protected, picker never offers owner, KYB tags inert). ---
 
-/** Clerk invitation for a brand-new invitee; acceptance -> user.created webhook -> clerkSync
- *  links clerk_user_id + flips the membership invited->active. */
-async function sendClerkInvitation(email: string): Promise<void> {
-  // redirect_url lands the invitee on OUR Lince /sign-up page (with the __clerk_ticket appended,
-  // which <SignUp> consumes to pre-fill the email + accept the invite) instead of Clerk's hosted
-  // Account Portal. Omitted when unset -> Clerk's default portal (dev fallback).
-  const payload: Record<string, string> = { email_address: email };
-  if (env.customerAppUrl) payload.redirect_url = `${env.customerAppUrl}/sign-up`;
-  const res = await fetch("https://api.clerk.com/v1/invitations", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${env.clerk.secretKey ?? ""}`, "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (res.ok) return;
-  // A Clerk 4xx duplicate_record means an invitation for this email already exists and will be
-  // delivered/accepted — treat as success so inviteMember doesn't compensate away the membership
-  // the accepted invite later flips to active. Decision extracted + unit-tested (isDuplicateInvitation).
-  const body = await res.json().catch(() => null);
-  if (isDuplicateInvitation(res.status, body)) return;
-  throw new Error(`clerk invitations.create ${res.status}`);
-}
-
 app.get("/app/team", rateLimit("reads"), async (_req: Request, res: Response) => {
   res.json({ members: await listMembers(res.locals.orgId) });
 });
 
 app.post("/app/team/invitations", rateLimit("beneficiary_write"), requirePermission("manage_team"), async (req: Request, res: Response) => {
   res.status(201).json(
-    await inviteMember(res.locals.orgId, res.locals.personId, (req.body ?? {}) as Record<string, unknown>, sendClerkInvitation),
+    await inviteMember(res.locals.orgId, res.locals.personId, (req.body ?? {}) as Record<string, unknown>, sendFreshInvitation),
   );
+});
+
+// Resend the invite email to a pending member (cooldown-guarded in the service).
+app.post("/app/team/members/:personId/resend", rateLimit("beneficiary_write"), requirePermission("manage_team"), async (req: Request, res: Response) => {
+  await resendInvitation(res.locals.orgId, res.locals.personId, String(req.params.personId), sendFreshInvitation);
+  res.json({ resent: true });
 });
 
 app.post("/app/team/members/:personId/role", rateLimit("beneficiary_write"), requirePermission("manage_roles"), async (req: Request, res: Response) => {
@@ -364,7 +349,7 @@ app.post("/app/team/members/:personId/role", rateLimit("beneficiary_write"), req
 });
 
 app.delete("/app/team/members/:personId", rateLimit("beneficiary_write"), requirePermission("manage_team"), async (req: Request, res: Response) => {
-  await removeMember(res.locals.orgId, res.locals.personId, String(req.params.personId));
+  await removeMember(res.locals.orgId, res.locals.personId, String(req.params.personId), revokeInvitationsFor);
   res.json({ removed: true });
 });
 

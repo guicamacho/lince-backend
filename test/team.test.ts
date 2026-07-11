@@ -6,11 +6,13 @@ import { resetDb, createOrg } from "./helpers.js";
 import {
   listMembers,
   inviteMember,
+  resendInvitation,
   changeMemberRole,
   removeMember,
   transferOwnership,
-  isDuplicateInvitation,
+  INVITE_COOLDOWN_SECONDS,
 } from "../src/modules/team/team.service.js";
+import { isDuplicateInvitation } from "../src/modules/team/clerkInvitations.js";
 import { activeMembershipForClerkUser } from "../src/modules/access/orgContext.js";
 import { linkClerkUserFromEvent } from "../src/modules/identity/clerkSync.js";
 import { HttpError } from "../src/http/error.js";
@@ -131,6 +133,102 @@ test("invite: sender resolving (Clerk duplicate_record treated as success in app
   );
   assert.equal(rows.rowCount, 1);
   assert.equal(rows.rows[0]!.status, "invited");
+});
+
+// Backdate a person's last-invite so the cooldown has elapsed (avoids waiting in tests).
+async function clearCooldown(email: string): Promise<void> {
+  await pool.query(
+    `update people set last_invited_at = now() - make_interval(secs => $1) where lower(email) = $2`,
+    [INVITE_COOLDOWN_SECONDS + 5, email.toLowerCase()],
+  );
+}
+
+test("resendInvitation: invited member re-sends, audits, then hits the cooldown until it elapses", async () => {
+  const { orgId, ownerId } = await activeOrgWithOwner();
+  const p = await makePerson("pending@t.test");
+  await addMembership(orgId, p, ["viewer"], "invited");
+  const sent: string[] = [];
+  const send = async (e: string) => {
+    sent.push(e);
+  };
+  await resendInvitation(orgId, ownerId, p, send);
+  assert.deepEqual(sent, ["pending@t.test"]);
+  const audit = await pool.query(`select 1 from audit_log where org_id=$1 and event='team.invitation_resent'`, [orgId]);
+  assert.equal(audit.rowCount, 1);
+  // immediate second resend is cooled down
+  await assert.rejects(resendInvitation(orgId, ownerId, p, send), (e) => e instanceof HttpError && e.statusCode === 429);
+  assert.equal(sent.length, 1); // sender NOT called on the cooled-down attempt
+  // after the cooldown elapses it sends again
+  await clearCooldown("pending@t.test");
+  await resendInvitation(orgId, ownerId, p, send);
+  assert.equal(sent.length, 2);
+});
+
+test("resendInvitation: a failed send releases the cooldown so retry isn't blocked", async () => {
+  const { orgId, ownerId } = await activeOrgWithOwner();
+  const p = await makePerson("retry@t.test");
+  await addMembership(orgId, p, ["viewer"], "invited");
+  const fail = async () => {
+    throw new Error("clerk down");
+  };
+  await assert.rejects(resendInvitation(orgId, ownerId, p, fail), (e) => e instanceof HttpError && e.statusCode === 502);
+  // cooldown was restored (null) -> an immediate retry is NOT throttled
+  const sent: string[] = [];
+  await resendInvitation(orgId, ownerId, p, async (e) => {
+    sent.push(e);
+  });
+  assert.deepEqual(sent, ["retry@t.test"]);
+});
+
+test("resendInvitation: rejects an active member (422) and an unknown person (404)", async () => {
+  const { orgId, ownerId } = await activeOrgWithOwner();
+  const active = await makePerson("act@t.test", "clerk_act");
+  await addMembership(orgId, active, ["finance"], "active");
+  await assert.rejects(resendInvitation(orgId, ownerId, active, noInvite), (e) => e instanceof HttpError && e.statusCode === 422);
+  await assert.rejects(
+    resendInvitation(orgId, ownerId, "00000000-0000-0000-0000-000000000000", noInvite),
+    (e) => e instanceof HttpError && e.statusCode === 404,
+  );
+});
+
+test("removeMember: revokes the pending Clerk invite for an invited member, not for an active one", async () => {
+  const { orgId, ownerId } = await activeOrgWithOwner();
+  const invited = await makePerson("inv@t.test");
+  await addMembership(orgId, invited, ["viewer"], "invited");
+  const active = await makePerson("act2@t.test", "clerk_act2");
+  await addMembership(orgId, active, ["finance"], "active");
+  const revoked: string[] = [];
+  const revoke = async (e: string) => {
+    revoked.push(e);
+  };
+  await removeMember(orgId, ownerId, invited, revoke);
+  await removeMember(orgId, ownerId, active, revoke);
+  assert.deepEqual(revoked, ["inv@t.test"]); // only the invited member's invite is revoked
+});
+
+test("invite cooldown survives removal: remove + immediate re-invite is throttled, then allowed", async () => {
+  const { orgId, ownerId } = await activeOrgWithOwner();
+  const sent: string[] = [];
+  const send = async (e: string) => {
+    sent.push(e);
+  };
+  const m = await inviteMember(orgId, ownerId, { email: "g@t.test", role: "viewer" }, send);
+  await removeMember(orgId, ownerId, m.personId, noInvite);
+  // people row (and last_invited_at) persists across removal -> re-invite is cooled down
+  await assert.rejects(
+    inviteMember(orgId, ownerId, { email: "g@t.test", role: "viewer" }, send),
+    (e) => e instanceof HttpError && e.statusCode === 429,
+  );
+  assert.equal(sent.length, 1);
+  // no dangling invited-but-never-emailed row from the throttled attempt
+  const rows = await pool.query(
+    `select 1 from org_people op join people p on p.id=op.person_id where op.org_id=$1 and lower(p.email)='g@t.test'`,
+    [orgId],
+  );
+  assert.equal(rows.rowCount, 0);
+  await clearCooldown("g@t.test");
+  await inviteMember(orgId, ownerId, { email: "g@t.test", role: "viewer" }, send);
+  assert.equal(sent.length, 2);
 });
 
 test("isDuplicateInvitation: only a 4xx duplicate_record is a success; 5xx and other 4xx throw", () => {

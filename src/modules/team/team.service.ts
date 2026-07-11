@@ -20,6 +20,10 @@ import { ACCESS_ROLES, accessRoles, type AccessRole } from "../access/permission
 export type AssignableRole = Exclude<AccessRole, "owner">;
 const ASSIGNABLE: readonly AssignableRole[] = ["admin", "finance", "viewer"];
 
+/** Min seconds between invitation emails to one person (anti-spam; PRD-03 F1). Kept in sync
+ *  with the customer app's resend countdown. */
+export const INVITE_COOLDOWN_SECONDS = 60;
+
 export interface TeamMember {
   personId: string;
   name: string;
@@ -58,19 +62,31 @@ function assertAssignable(role: string): asserts role is AssignableRole {
 }
 
 /**
- * Should a failed Clerk invitations.create be treated as "already delivered" rather than a
- * failure? True ONLY for a 4xx carrying `duplicate_record` — an invitation for this email
- * already exists and will be delivered/accepted, so the caller must NOT compensate away the
- * membership. A 5xx (even a duplicate-shaped body) is a genuine failure → retry/compensate.
- * Pure so the return-vs-throw branch is unit-tested without stubbing global fetch.
+ * Claim the per-person invite-email cooldown slot atomically: sets last_invited_at=now() only if
+ * the cooldown has elapsed. `claimed` is false when within cooldown. `previous` is the timestamp
+ * before the claim (for restore if the send then fails, so a transient failure doesn't burn the
+ * cooldown). The conditional UPDATE also serialises concurrent sends — only one wins the slot.
  */
-export function isDuplicateInvitation(status: number, body: unknown): boolean {
-  if (status < 400 || status >= 500) return false;
-  const errors = (body as { errors?: { code?: string }[] } | null)?.errors;
-  return Array.isArray(errors) && errors.some((e) => e.code === "duplicate_record");
+async function claimInviteCooldown(
+  q: Pick<pg.PoolClient, "query">,
+  personId: string,
+): Promise<{ claimed: boolean; previous: Date | null }> {
+  const { rows } = await q.query<{ previous: Date | null }>(
+    `with prev as (select last_invited_at from people where id = $1)
+     update people set last_invited_at = now()
+      where id = $1 and (last_invited_at is null or last_invited_at <= now() - make_interval(secs => $2))
+      returning (select last_invited_at from prev) as previous`,
+    [personId, INVITE_COOLDOWN_SECONDS],
+  );
+  return rows[0] ? { claimed: true, previous: rows[0].previous } : { claimed: false, previous: null };
 }
 
-async function audit(c: pg.PoolClient, orgId: string, actorPersonId: string, event: string, payload: unknown) {
+/** Undo a cooldown claim (send failed) so a legit retry isn't blocked for the full window. */
+async function restoreInviteCooldown(q: Pick<pg.PoolClient, "query">, personId: string, previous: Date | null) {
+  await q.query(`update people set last_invited_at = $2 where id = $1`, [personId, previous]);
+}
+
+async function audit(c: Pick<pg.PoolClient, "query">, orgId: string, actorPersonId: string, event: string, payload: unknown) {
   await c.query(
     `insert into audit_log (org_id, actor_type, actor_id, event, payload) values ($1, 'user', $2, $3, $4)`,
     [orgId, actorPersonId, event, JSON.stringify(payload)],
@@ -128,6 +144,14 @@ export async function inviteMember(
       }
     }
     const status: TeamMember["status"] = hasClerkAccount ? "active" : "invited";
+    // Only 'invited' members get an email — claim the cooldown slot BEFORE inserting the
+    // membership so a cooldown-blocked invite leaves no dangling invited-but-never-emailed row.
+    let cooldownPrev: Date | null = null;
+    if (status === "invited") {
+      const claim = await claimInviteCooldown(c, personId);
+      if (!claim.claimed) throw new HttpError("invite_cooldown", 429);
+      cooldownPrev = claim.previous;
+    }
     const membership = await c.query<{ roles: string[]; status: TeamMember["status"] }>(
       `insert into org_people (org_id, person_id, roles, status) values ($1, $2, $3, $4)
        on conflict (org_id, person_id) do nothing
@@ -143,6 +167,7 @@ export async function inviteMember(
       roles: [role] as AccessRole[],
       status,
       needsClerkInvitation: !hasClerkAccount,
+      cooldownPrev,
     };
   });
 
@@ -150,15 +175,49 @@ export async function inviteMember(
     try {
       await sendClerkInvitation(email);
     } catch {
-      // compensate: an invite the invitee can never receive must not linger as a row
+      // compensate: an invite the invitee can never receive must not linger as a row, and the
+      // cooldown it claimed is released so a retry of a transient failure isn't blocked 60s.
       await pool.query(`delete from org_people where org_id = $1 and person_id = $2 and status = 'invited'`, [
         orgId,
         created.personId,
       ]);
+      await restoreInviteCooldown(pool, created.personId, created.cooldownPrev);
       throw new HttpError("invite_delivery_failed", 502);
     }
   }
   return { personId: created.personId, name: created.name, email: created.email, roles: created.roles, status: created.status };
+}
+
+/**
+ * Resend the invitation email to a still-'invited' member (PRD-03 F1 retry). Cooldown-guarded
+ * (per-person, anti-spam) via an atomic slot claim; sends a FRESH invite (revoke+recreate at the
+ * Clerk layer). No membership mutation, so no lock — the conditional claim serialises concurrent
+ * resends. `sendInvitation` is injected (tests stub it).
+ */
+export async function resendInvitation(
+  orgId: string,
+  actorPersonId: string,
+  targetPersonId: string,
+  sendInvitation: (email: string) => Promise<void>,
+): Promise<void> {
+  const { rows } = await pool.query<{ status: TeamMember["status"]; email: string }>(
+    `select op.status, p.email from org_people op join people p on p.id = op.person_id
+      where op.org_id = $1 and op.person_id = $2`,
+    [orgId, targetPersonId],
+  );
+  const member = rows[0];
+  if (!member) throw new HttpError("member_not_found", 404);
+  if (member.status !== "invited") throw new HttpError("member_not_invited", 422);
+  const claim = await claimInviteCooldown(pool, targetPersonId);
+  if (!claim.claimed) throw new HttpError("invite_cooldown", 429);
+  try {
+    await sendInvitation(member.email);
+  } catch {
+    // release the just-claimed slot so a transient Clerk failure doesn't block retry for 60s
+    await restoreInviteCooldown(pool, targetPersonId, claim.previous);
+    throw new HttpError("invite_delivery_failed", 502);
+  }
+  await audit(pool, orgId, actorPersonId, "team.invitation_resent", { personId: targetPersonId, email: member.email });
 }
 
 /** Lock the target membership row; 404 if absent. Owner rows are protected for demote/remove. */
@@ -195,17 +254,32 @@ export async function changeMemberRole(
   });
 }
 
-/** F3 — remove a member (revokes the org_people row; PRD-03 F3). Owner is protected. */
-export async function removeMember(orgId: string, actorPersonId: string, targetPersonId: string): Promise<void> {
-  await withTransaction(async (c) => {
+/**
+ * F3 — remove a member (revokes the org_people row; PRD-03 F3). Owner is protected. If the removed
+ * member was still 'invited', their pending Clerk invitation is revoked (best-effort) so state
+ * doesn't dangle and a later re-invite starts clean. `revokeInvitations` is injected (tests stub it).
+ */
+export async function removeMember(
+  orgId: string,
+  actorPersonId: string,
+  targetPersonId: string,
+  revokeInvitations?: (email: string) => Promise<void>,
+): Promise<void> {
+  const removed = await withTransaction(async (c) => {
     const target = await lockMembership(c, orgId, targetPersonId);
     if (target.roles.includes("owner")) throw new HttpError("owner_protected", 403);
-    await c.query(`delete from org_people where org_id = $1 and person_id = $2`, [orgId, targetPersonId]);
+    const { rows } = await c.query<{ email: string }>(
+      `delete from org_people where org_id = $1 and person_id = $2
+       returning (select email from people where id = $2) as email`,
+      [orgId, targetPersonId],
+    );
     await audit(c, orgId, actorPersonId, "team.removed", {
       personId: targetPersonId,
       roles: accessRoles(target.roles),
     });
+    return { wasInvited: target.status === "invited", email: rows[0]?.email ?? null };
   });
+  if (removed.wasInvited && removed.email && revokeInvitations) await revokeInvitations(removed.email);
 }
 
 /**
