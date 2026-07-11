@@ -54,6 +54,10 @@ export async function linkClerkUserFromEvent(event: ClerkUserEvent): Promise<str
         clerkUserId,
         fullName,
       ]);
+      // A pre-created invitee (PRD-03 F1) just accepted: their pending memberships go live.
+      await c.query("update org_people set status = 'active' where person_id = $1 and status = 'invited'", [
+        existing.rows[0].id,
+      ]);
       return existing.rows[0].id;
     }
 

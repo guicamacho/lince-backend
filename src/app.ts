@@ -33,7 +33,9 @@ import express, { type Request, type Response, type NextFunction } from "express
 import { env } from "./config/env.js";
 import { clerkMiddleware, getAuth } from "@clerk/express";
 import { pool } from "./db/pool.js";
-import { activeOrgForClerkUser } from "./modules/access/orgContext.js";
+import { activeMembershipForClerkUser } from "./modules/access/orgContext.js";
+import { requirePermission, accessRoles } from "./modules/access/permissions.js";
+import { listMembers, inviteMember, changeMemberRole, removeMember, transferOwnership, isDuplicateInvitation } from "./modules/team/team.service.js";
 import { setOrgAccess } from "./modules/access/access.service.js";
 import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
@@ -248,18 +250,21 @@ app.use("/app", async (req: Request, res: Response, next: NextFunction) => {
     res.status(401).json({ error: "unauthenticated" });
     return;
   }
-  const orgId = await activeOrgForClerkUser(userId);
-  if (!orgId) {
+  const membership = await activeMembershipForClerkUser(userId);
+  if (!membership) {
     res.status(403).json({ error: "no_active_org" });
     return;
   }
-  res.locals.orgId = orgId;
+  res.locals.orgId = membership.orgId;
+  res.locals.personId = membership.personId;
+  res.locals.roles = membership.roles; // raw; requirePermission filters to the access subset
   next();
 });
 
 app.get("/app/me", rateLimit("reads"), async (_req: Request, res: Response) => {
   const { rows } = await pool.query("select id, razao_social, state from orgs where id = $1", [res.locals.orgId]);
-  res.json(rows[0] ?? null);
+  // roles: access subset only — KYB tags never reach the UI (PRD-03 §5)
+  res.json(rows[0] ? { ...rows[0], roles: accessRoles(res.locals.roles as string[]) } : null);
 });
 
 // Avenia deposit details (PIX + wallets) — post-approval only (the /app gate = the admin
@@ -271,16 +276,16 @@ app.get("/app/deposit-details", rateLimit("reads"), async (_req: Request, res: R
 
 // Create a PIX deposit: amount -> subaccount-scoped quote+ticket -> brCode the customer pays.
 // Idempotent on (org, idemKey) with payload binding (PRD-07 §2 p5). First real money producer.
-app.post("/app/deposits", rateLimit("beneficiary_write"), async (req: Request, res: Response) => {
-  const { userId } = getAuth(req);
-  const person = await pool.query<{ id: string }>("select id from people where clerk_user_id = $1", [userId]);
+// Gated as money movement (PRD-03 §1): viewer is read-only, so creating a PIX charge maps to
+// initiate_payout (deposit-create is the closest money atom; a dedicated one is over-modeling).
+app.post("/app/deposits", rateLimit("beneficiary_write"), requirePermission("initiate_payout"), async (req: Request, res: Response) => {
   const { amountBrl, idemKey } = (req.body ?? {}) as { amountBrl?: string; idemKey?: string };
   if (!amountBrl || !idemKey) {
     res.status(422).json({ error: "amountBrl_and_idemKey_required" });
     return;
   }
   res.status(201).json(
-    await createDeposit(res.locals.orgId, person.rows[0]?.id ?? null, { amountBrl, idemKey }, aveniaFromEnv()),
+    await createDeposit(res.locals.orgId, res.locals.personId ?? null, { amountBrl, idemKey }, aveniaFromEnv()),
   );
 });
 
@@ -304,6 +309,7 @@ app.get("/app/beneficiaries", rateLimit("reads"), async (_req: Request, res: Res
 app.post(
   "/app/beneficiaries",
   rateLimit("beneficiary_write"),
+  requirePermission("manage_beneficiaries"),
   requireStepUp(env.stepUp.enforced),
   // Payees are the money-out surface: an ENROLLED second factor is ALWAYS required here
   // (authoritative Clerk lookup, fail-closed; global MFA policy stays optional elsewhere).
@@ -312,6 +318,61 @@ app.post(
   async (req: Request, res: Response) => {
     const { userId } = getAuth(req);
     res.json(await createBeneficiaryForOrg(res.locals.orgId, userId, (req.body ?? {}) as Record<string, unknown>));
+  },
+);
+
+// --- Team (PRD-03 F1/F3/F7). requirePermission is the WHO gate (owner/admin); the service
+//     enforces WHAT is legal (owner protected, picker never offers owner, KYB tags inert). ---
+
+/** Clerk invitation for a brand-new invitee; acceptance -> user.created webhook -> clerkSync
+ *  links clerk_user_id + flips the membership invited->active. */
+async function sendClerkInvitation(email: string): Promise<void> {
+  const res = await fetch("https://api.clerk.com/v1/invitations", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.clerk.secretKey ?? ""}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ email_address: email }),
+  });
+  if (res.ok) return;
+  // A Clerk 4xx duplicate_record means an invitation for this email already exists and will be
+  // delivered/accepted — treat as success so inviteMember doesn't compensate away the membership
+  // the accepted invite later flips to active. Decision extracted + unit-tested (isDuplicateInvitation).
+  const body = await res.json().catch(() => null);
+  if (isDuplicateInvitation(res.status, body)) return;
+  throw new Error(`clerk invitations.create ${res.status}`);
+}
+
+app.get("/app/team", rateLimit("reads"), async (_req: Request, res: Response) => {
+  res.json({ members: await listMembers(res.locals.orgId) });
+});
+
+app.post("/app/team/invitations", rateLimit("beneficiary_write"), requirePermission("manage_team"), async (req: Request, res: Response) => {
+  res.status(201).json(
+    await inviteMember(res.locals.orgId, res.locals.personId, (req.body ?? {}) as Record<string, unknown>, sendClerkInvitation),
+  );
+});
+
+app.post("/app/team/members/:personId/role", rateLimit("beneficiary_write"), requirePermission("manage_roles"), async (req: Request, res: Response) => {
+  const role = String((req.body as { role?: unknown } | null)?.role ?? "");
+  res.json({
+    roles: await changeMemberRole(res.locals.orgId, res.locals.personId, String(req.params.personId), role),
+  });
+});
+
+app.delete("/app/team/members/:personId", rateLimit("beneficiary_write"), requirePermission("manage_team"), async (req: Request, res: Response) => {
+  await removeMember(res.locals.orgId, res.locals.personId, String(req.params.personId));
+  res.json({ removed: true });
+});
+
+// Owner-only + step-up (PRD-03 F7: step-up + confirm; audit-logged in the service).
+app.post(
+  "/app/team/transfer-ownership",
+  rateLimit("beneficiary_write"),
+  requirePermission("transfer_ownership"),
+  requireStepUp(env.stepUp.enforced),
+  async (req: Request, res: Response) => {
+    const to = String((req.body as { toPersonId?: unknown } | null)?.toPersonId ?? "");
+    await transferOwnership(res.locals.orgId, res.locals.personId, to);
+    res.json({ transferred: true });
   },
 );
 
