@@ -130,3 +130,18 @@ export async function replayWebhookEvent(id: string): Promise<void> {
     [id],
   );
 }
+
+/**
+ * The /admin surface's guarded replay (PRD-04 §4.8): only failed/dead events are replayable —
+ * re-running a processed event would re-fire handlers for no reason (they're idempotent, but
+ * it's operator noise), and a 'received' event is already queued. The conditional UPDATE makes
+ * the guard atomic. Returns false when the event wasn't in a replayable state (route → 409).
+ */
+export async function replayFailedWebhook(id: string, q: Pick<pg.PoolClient, "query"> = pool): Promise<boolean> {
+  const { rows } = await q.query(
+    `update webhook_events set status = 'received', attempts = 0, last_error = null, processed_at = null
+      where id = $1 and status in ('failed','dead') returning 1`,
+    [id],
+  );
+  return rows.length > 0;
+}

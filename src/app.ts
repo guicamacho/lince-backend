@@ -32,7 +32,7 @@ import { HttpError } from "./http/error.js";
 import express, { type Request, type Response, type NextFunction } from "express";
 import { env } from "./config/env.js";
 import { clerkMiddleware, getAuth } from "@clerk/express";
-import { pool } from "./db/pool.js";
+import { pool, withTransaction } from "./db/pool.js";
 import { activeMembershipForClerkUser } from "./modules/access/orgContext.js";
 import { requirePermission, accessRoles } from "./modules/access/permissions.js";
 import { listMembers, inviteMember, resendInvitation, changeMemberRole, removeMember, transferOwnership } from "./modules/team/team.service.js";
@@ -43,7 +43,7 @@ import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
 import { ensureAveniaSubaccount, depositDetailsForOrg } from "./modules/onboarding/aveniaProvisioning.js";
-import { createDeposit, listTransactionsForOrg, reconcileInFlightDeposits } from "./modules/money/deposits.js";
+import { createDeposit, listTransactionsForOrg, reconcileInFlightDeposits, mapVendorFees } from "./modules/money/deposits.js";
 import { balancesForOrg } from "./modules/ledger/ledger.service.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { requireStepUp } from "./modules/access/requireStepUp.js";
@@ -51,7 +51,7 @@ import { requireMfaEnrolled } from "./modules/access/requireMfa.js";
 import { rateLimit } from "./modules/ratelimit/middleware.js";
 import { receiveWebhook } from "./modules/webhooks/inbox.js";
 import { aveniaWebhookPublicKey } from "./modules/webhooks/aveniaKey.js";
-import { drainWebhooks } from "./modules/webhooks/processor.js";
+import { drainWebhooks, replayFailedWebhook } from "./modules/webhooks/processor.js";
 import { drainOutboxOnce } from "./modules/notifications/outbox.js";
 import { recordAveniaVerdict } from "./modules/onboarding/admission.service.js";
 import { listBeneficiariesForOrg, createBeneficiaryForOrg } from "./modules/beneficiaries/beneficiaries.service.js";
@@ -414,6 +414,77 @@ app.get("/admin/orgs", rateLimit("admin_export"), requireAdminServiceToken, asyn
        from orgs where deleted_at is null order by created_at desc limit 200`,
   );
   res.json({ orgs: rows });
+});
+
+// Unified all-orgs transactions view (PRD-04 §4.4): Avenia ticket lifecycle straight from the
+// stored quote; amounts in minor units (the admin app formats). Last 200; the grid filters
+// client-side like the orgs grid. ponytail: add query-param filters when 200 rows stop being
+// enough for ops.
+app.get("/admin/transactions", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
+  const { rows } = await pool.query(
+    `select t.id, t.org_id, o.razao_social, t.type, t.state, t.source_currency, t.source_amount,
+            t.dest_currency, t.dest_amount, t.vendor_ref, t.created_at,
+            t.quote->>'ticketStatus' as ticket_status, t.quote->'appliedFees' as applied_fees
+       from org_transactions t join orgs o on o.id = t.org_id
+      order by t.created_at desc limit 200`,
+  );
+  res.json({
+    transactions: rows.map((r) => ({
+      id: r.id,
+      orgId: r.org_id,
+      razaoSocial: r.razao_social,
+      type: r.type,
+      state: r.state,
+      ticketStatus: r.ticket_status ?? "UNPAID",
+      sourceCurrency: r.source_currency,
+      sourceAmount: r.source_amount === null ? null : Number(r.source_amount),
+      destCurrency: r.dest_currency,
+      destAmount: r.dest_amount === null ? null : Number(r.dest_amount),
+      // shape-hardened: one malformed vendor fee snapshot must not 500 the all-orgs view
+      fees: mapVendorFees(r.applied_fees),
+      vendorRef: r.vendor_ref,
+      createdAt: r.created_at,
+    })),
+  });
+});
+
+// Events & Webhooks health (PRD-04 §4.8): processing status across providers. Failures are the
+// actionable rows; the grid tabs by status client-side.
+app.get("/admin/webhooks", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
+  const { rows } = await pool.query(
+    `select id, provider_code, event_type, external_event_id, status, attempts, last_error,
+            received_at, processed_at
+       from webhook_events
+      order by (status in ('failed','dead')) desc, received_at desc
+      limit 200`,
+  );
+  res.json({ events: rows });
+});
+
+// Replay a failed/dead event back through the drain (idempotent handlers make it safe).
+// Order matters: resolve the actor FIRST, then reset + audit in ONE transaction — a replay
+// re-fires a money-path handler and must never commit without its compliance trail.
+app.post("/admin/webhooks/:id/replay", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+  const { adminClerkUserId, adminEmail, adminName } = req.body ?? {};
+  if (!adminClerkUserId || !adminEmail) {
+    res.status(400).json({ error: "missing_admin_identity" });
+    return;
+  }
+  const eventId = String(req.params.id);
+  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  const replayed = await withTransaction(async (c) => {
+    if (!(await replayFailedWebhook(eventId, c))) return false;
+    await c.query(
+      `insert into audit_log (org_id, actor_type, actor_id, event, payload) values (null, 'ops', $1, 'admin.webhook_replayed', $2)`,
+      [adminId, JSON.stringify({ eventId })],
+    );
+    return true;
+  });
+  if (!replayed) {
+    res.status(409).json({ error: "not_replayable" });
+    return;
+  }
+  res.json({ replayed: true });
 });
 
 // Record Avenia's decision (the relay gate). approved -> org active; rejected -> rejected +

@@ -222,3 +222,19 @@ test("reconciler recovers a crash-orphan ('created', null vendor_ref) via extern
   assert.equal(rows[0].dest_amount, "9980");
   assert.equal(rows[0].state, "settled");
 });
+
+test("mapVendorFees: raw vendor jsonb of any shape degrades, never throws", async () => {
+  const { mapVendorFees } = await import("../src/modules/money/deposits.js");
+  // well-formed
+  const ok = mapVendorFees([{ type: "Gas fee", amount: "1.50", currency: "BRL", rebatable: true }]);
+  const first = ok[0]!;
+  const strict = (await import("node:assert/strict")).default;
+  strict.deepEqual(first, { label: "Gas fee", amount: 150, currency: "BRL", rebatable: true });
+  // hostile shapes: object instead of array, null elements, junk fields — the exact class that
+  // once 500'd a transactions list; on the all-orgs admin view the blast radius is every row
+  strict.deepEqual(mapVendorFees({}), []);
+  strict.deepEqual(mapVendorFees(null), []);
+  strict.deepEqual(mapVendorFees("nope"), []);
+  strict.deepEqual(mapVendorFees([null, 42, "x"]), []);
+  strict.equal(mapVendorFees([{ amount: "bad", currency: "toString" }])[0]!.amount, 0); // hardened scalars
+});

@@ -3,7 +3,7 @@ import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { pool } from "../src/db/pool.js";
-import { drainWebhooks, replayWebhookEvent, type WebhookHandler } from "../src/modules/webhooks/processor.js";
+import { drainWebhooks, replayWebhookEvent, replayFailedWebhook, type WebhookHandler } from "../src/modules/webhooks/processor.js";
 import { receiveWebhook } from "../src/modules/webhooks/inbox.js";
 import { resetDb } from "./helpers.js";
 
@@ -167,4 +167,28 @@ test("receiveWebhook returns 503 when a Svix provider is unconfigured", async ()
     config: {},
   });
   assert.equal(res.status, 503);
+});
+
+test("replayFailedWebhook: only failed/dead events reset; processed/received are refused", async () => {
+  const failed = await insertEvent("avenia", "rp-1");
+  await pool.query(`update webhook_events set status='failed', attempts=3, last_error='boom' where id=$1`, [failed]);
+  const dead = await insertEvent("avenia", "rp-2");
+  await pool.query(`update webhook_events set status='dead', attempts=8 where id=$1`, [dead]);
+  const processed = await insertEvent("avenia", "rp-3");
+  await pool.query(`update webhook_events set status='processed' where id=$1`, [processed]);
+  const received = await insertEvent("avenia", "rp-4");
+
+  assert.equal(await replayFailedWebhook(failed), true);
+  assert.equal(await replayFailedWebhook(dead), true);
+  assert.equal(await replayFailedWebhook(processed), false); // no side-effect re-runs from ops clicks
+  assert.equal(await replayFailedWebhook(received), false); // already queued
+  const { rows } = await pool.query(
+    `select id, status, attempts, last_error from webhook_events where id = any($1) order by external_event_id`,
+    [[failed, dead]],
+  );
+  for (const r of rows) {
+    assert.equal(r.status, "received"); // back in the drain
+    assert.equal(r.attempts, 0);
+    assert.equal(r.last_error, null);
+  }
 });

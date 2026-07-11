@@ -49,11 +49,38 @@ interface TxRow {
   quote: Record<string, unknown> | null;
 }
 
+export interface MappedFee {
+  label: string;
+  amount: number;
+  currency: string;
+  rebatable: boolean;
+}
+
+/**
+ * Map a stored quote's appliedFees (RAW vendor jsonb) to display fees. The whole shape is
+ * untrusted, not just amount/currency: a non-array or a null element must degrade to nothing,
+ * never throw — a single malformed fee on one snapshot once 500'd a whole transactions list,
+ * and on the all-orgs admin view the blast radius is every row. vendorMinor hardens the
+ * amount/currency scalars; this hardens the array/element shape.
+ */
+export function mapVendorFees(raw: unknown): MappedFee[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((f): f is { type?: unknown; amount?: unknown; currency?: unknown; rebatable?: unknown } =>
+      typeof f === "object" && f !== null)
+    .map((f) => ({
+      label: String(f.type ?? "fee"),
+      amount: Number(vendorMinor(String(f.amount ?? ""), (f.currency as Currency) ?? "BRL")),
+      currency: String(f.currency ?? "BRL"),
+      rebatable: f.rebatable === true,
+    }));
+}
+
 function receiptFrom(row: TxRow): DepositReceipt {
   const quote = (row.quote ?? {}) as {
     brCode?: string;
     expiration?: string;
-    appliedFees?: Array<{ type: string; amount: string; currency: string; rebatable: boolean }>;
+    appliedFees?: unknown;
   };
   return {
     id: row.id,
@@ -62,13 +89,7 @@ function receiptFrom(row: TxRow): DepositReceipt {
     expiration: quote.expiration ?? null,
     sourceAmount: Number(row.source_amount),
     destAmount: row.dest_amount === null ? null : Number(row.dest_amount),
-    fees: (quote.appliedFees ?? []).map((f) => ({
-      label: f.type,
-      // vendorMinor is lenient + non-throwing: a stray fee precision never crashes the read.
-      amount: Number(vendorMinor(f.amount, (f.currency as Currency) ?? "BRL")),
-      currency: f.currency,
-      rebatable: f.rebatable,
-    })),
+    fees: mapVendorFees(quote.appliedFees),
   };
 }
 
@@ -222,7 +243,7 @@ export async function listTransactionsForOrg(orgId: string): Promise<unknown[]> 
       ticketStatus?: string;
       basePrice?: string;
       pairName?: string;
-      appliedFees?: Array<{ type: string; amount: string; currency: string; rebatable: boolean }>;
+      appliedFees?: unknown;
     };
     return {
       id: r.id,
@@ -233,12 +254,7 @@ export async function listTransactionsForOrg(orgId: string): Promise<unknown[]> 
       sourceAmount: Number(r.source_amount),
       destCurrency: r.dest_currency,
       destAmount: r.dest_amount === null ? 0 : Number(r.dest_amount),
-      fees: (quote.appliedFees ?? []).map((f) => ({
-        label: f.type,
-        amount: Number(vendorMinor(f.amount, (f.currency as Currency) ?? "BRL")),
-        currency: f.currency,
-        rebatable: f.rebatable,
-      })),
+      fees: mapVendorFees(quote.appliedFees),
       rebate: null,
       beneficiaryLabel: null,
       createdAt: r.created_at,
