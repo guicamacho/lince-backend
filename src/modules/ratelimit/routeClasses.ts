@@ -83,6 +83,8 @@ export const ROUTE_CLASSMAP: Record<string, RouteClass> = {
   "POST /admin/cases/:id/messages": "admin_export",
   "POST /admin/cases/:id/status": "admin_export",
   "POST /admin/cases/:id/assign": "admin_export",
+  "GET /admin/admins": "admin_export",
+  "POST /admin/admins/:id/roles": "admin_export",
   "GET /admin/orgs": "admin_export",
   "GET /admin/orgs/:id/documents": "admin_export",
   "GET /admin/transactions": "admin_export",

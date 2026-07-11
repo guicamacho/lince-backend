@@ -57,8 +57,9 @@ import { drainWebhooks, replayFailedWebhook } from "./modules/webhooks/processor
 import { drainOutboxOnce } from "./modules/notifications/outbox.js";
 import { recordAveniaVerdict } from "./modules/onboarding/admission.service.js";
 import { listBeneficiariesForOrg, createBeneficiaryForOrg } from "./modules/beneficiaries/beneficiaries.service.js";
-import { ensureAdminUser } from "./modules/identity/adminSync.js";
 import { requireAdminServiceToken } from "./modules/access/adminAuth.js";
+import { requireAdminActor, requireAdminAccess, requireAdminRole, actingAdminId } from "./modules/access/adminActor.js";
+import { listAdmins, setAdminRoles } from "./modules/admin/staff.js";
 import { MockKybProvider } from "./modules/providers/didit/mock.kyb.js";
 import { getOrgDetail } from "./modules/admin/orgDetail.js";
 import { getAdmissionAging } from "./modules/admin/aging.js";
@@ -75,6 +76,15 @@ import {
   postCustomerCaseReply,
 } from "./modules/cases/customerInbox.service.js";
 import { raiseRfi } from "./modules/onboarding/rfi.service.js";
+
+// Fail closed: the admin verified-identity path (PRD-08 §5.1) must not silently degrade to
+// body-trust in production, and maker-checker is meaningless without it. Assert at boot.
+if (process.env.NODE_ENV === "production" && !env.adminClerk.secretKey) {
+  throw new Error("ADMIN_CLERK_SECRET_KEY is required in production (admin identity would fall back to body-trust)");
+}
+if (env.makerCheckerEnabled && !env.adminClerk.secretKey) {
+  throw new Error("MAKER_CHECKER_ENABLED requires ADMIN_CLERK_SECRET_KEY (four-eyes needs verified admin identity)");
+}
 
 export const app = express();
 // Trust exactly N proxy hops (Cloudflare tunnel + Fly) so req.ip is the real client IP for
@@ -441,9 +451,13 @@ app.post(
   },
 );
 
-// --- Admin (internal) — service-token gated; the admin app authenticates staff via
-//     its own (separate) Clerk instance, then calls these server-to-server. ---
-app.get("/admin/orgs", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
+// --- Admin (internal). Two gates for every /admin route: the service token (network guard) and
+//     the admin ACTOR (PRD-08 §5.1): when ADMIN_CLERK_SECRET_KEY is set, the actor is bound to a
+//     verified admin Clerk session and roles are enforced; else legacy body-trust. Write routes
+//     add requireAdminRole(...) and use actingAdminId(res) instead of the body identity. ---
+app.use("/admin", requireAdminServiceToken, requireAdminActor, requireAdminAccess);
+
+app.get("/admin/orgs", rateLimit("admin_export"), async (_req: Request, res: Response) => {
   const { rows } = await pool.query(
     `select id, cnpj, razao_social, state, admission_state, access_status, kyb_forwarded_at, created_at
        from orgs where deleted_at is null order by created_at desc limit 200`,
@@ -455,7 +469,7 @@ app.get("/admin/orgs", rateLimit("admin_export"), requireAdminServiceToken, asyn
 // stored quote; amounts in minor units (the admin app formats). Last 200; the grid filters
 // client-side like the orgs grid. ponytail: add query-param filters when 200 rows stop being
 // enough for ops.
-app.get("/admin/transactions", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
+app.get("/admin/transactions", rateLimit("admin_export"), async (_req: Request, res: Response) => {
   const { rows } = await pool.query(
     `select t.id, t.org_id, o.razao_social, t.type, t.state, t.source_currency, t.source_amount,
             t.dest_currency, t.dest_amount, t.vendor_ref, t.created_at,
@@ -485,7 +499,7 @@ app.get("/admin/transactions", rateLimit("admin_export"), requireAdminServiceTok
 
 // Uploaded document references for an org (ops visibility; NO bytes exist to serve). Ops uses
 // these to know a customer provided EDD docs, then forwards to Avenia manually.
-app.get("/admin/orgs/:id/documents", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+app.get("/admin/orgs/:id/documents", rateLimit("admin_export"), async (req: Request, res: Response) => {
   const { rows } = await pool.query(
     `select d.id, d.filename, d.content_type, d.size_bytes, d.status, d.didit_ref, d.created_at, d.case_id
        from document_uploads d where d.org_id = $1 order by d.created_at desc limit 200`,
@@ -496,7 +510,7 @@ app.get("/admin/orgs/:id/documents", rateLimit("admin_export"), requireAdminServ
 
 // Events & Webhooks health (PRD-04 §4.8): processing status across providers. Failures are the
 // actionable rows; the grid tabs by status client-side.
-app.get("/admin/webhooks", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
+app.get("/admin/webhooks", rateLimit("admin_export"), async (_req: Request, res: Response) => {
   const { rows } = await pool.query(
     `select id, provider_code, event_type, external_event_id, status, attempts, last_error,
             received_at, processed_at
@@ -510,14 +524,9 @@ app.get("/admin/webhooks", rateLimit("admin_export"), requireAdminServiceToken, 
 // Replay a failed/dead event back through the drain (idempotent handlers make it safe).
 // Order matters: resolve the actor FIRST, then reset + audit in ONE transaction — a replay
 // re-fires a money-path handler and must never commit without its compliance trail.
-app.post("/admin/webhooks/:id/replay", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
-  const { adminClerkUserId, adminEmail, adminName } = req.body ?? {};
-  if (!adminClerkUserId || !adminEmail) {
-    res.status(400).json({ error: "missing_admin_identity" });
-    return;
-  }
+app.post("/admin/webhooks/:id/replay", rateLimit("admin_export"), requireAdminRole("treasury_ops", "support"), async (req: Request, res: Response) => {
   const eventId = String(req.params.id);
-  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  const adminId = actingAdminId(res);
   const replayed = await withTransaction(async (c) => {
     if (!(await replayFailedWebhook(eventId, c))) return false;
     await c.query(
@@ -536,12 +545,8 @@ app.post("/admin/webhooks/:id/replay", rateLimit("admin_export"), requireAdminSe
 // Record Avenia's decision (the relay gate). approved -> org active; rejected -> rejected +
 // CNPJ denylist (with the mandatory reason). Audit-logged AS A RELAY inside recordAveniaVerdict.
 // Modelo A: this records Avenia's verdict, not a Lince adjudication.
-app.post("/admin/orgs/:id/verdict", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
-  const { adminClerkUserId, adminEmail, adminName, decision, aveniaReference, remark } = req.body ?? {};
-  if (!adminClerkUserId || !adminEmail) {
-    res.status(400).json({ error: "missing_admin_identity" });
-    return;
-  }
+app.post("/admin/orgs/:id/verdict", rateLimit("admin_export"), requireAdminRole("compliance"), async (req: Request, res: Response) => {
+  const { decision, aveniaReference, remark } = req.body ?? {};
   if (decision !== "approved" && decision !== "rejected") {
     res.status(400).json({ error: "invalid_decision" });
     return;
@@ -551,7 +556,7 @@ app.post("/admin/orgs/:id/verdict", rateLimit("admin_export"), requireAdminServi
     return;
   }
   const orgId = String(req.params.id);
-  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  const adminId = actingAdminId(res);
   await recordAveniaVerdict({
     orgId,
     decision,
@@ -565,29 +570,20 @@ app.post("/admin/orgs/:id/verdict", rateLimit("admin_export"), requireAdminServi
 
 // Relay an Avenia EDD info request to the customer (org -> rfi_required + customer-visible
 // message). Modelo A: a relay, not a Lince request. Audit-logged inside raiseRfi.
-app.post("/admin/orgs/:id/rfi", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
-  const { adminClerkUserId, adminEmail, adminName, message } = req.body ?? {};
-  if (!adminClerkUserId || !adminEmail) {
-    res.status(400).json({ error: "missing_admin_identity" });
-    return;
-  }
+app.post("/admin/orgs/:id/rfi", rateLimit("admin_export"), requireAdminRole("compliance"), async (req: Request, res: Response) => {
+  const { message } = req.body ?? {};
   if (!String(message ?? "").trim()) {
     res.status(400).json({ error: "message_required" });
     return;
   }
-  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
-  res.json(await raiseRfi({ orgId: String(req.params.id), adminId, message: String(message) }));
+  res.json(await raiseRfi({ orgId: String(req.params.id), adminId: actingAdminId(res), message: String(message) }));
 });
 
 // Suspend / block / reinstate an org's access (the 0002 access_status seam). Lifecycle
 // `state` is untouched — this is an operational gate, not an admission decision. The
 // mandatory reason is enforced in setOrgAccess and audit-logged as org.access_changed.
-app.post("/admin/orgs/:id/access", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
-  const { adminClerkUserId, adminEmail, adminName, action, reason, source } = req.body ?? {};
-  if (!adminClerkUserId || !adminEmail) {
-    res.status(400).json({ error: "missing_admin_identity" });
-    return;
-  }
+app.post("/admin/orgs/:id/access", rateLimit("admin_export"), requireAdminRole("compliance"), async (req: Request, res: Response) => {
+  const { action, reason, source } = req.body ?? {};
   if (action !== "suspend" && action !== "block" && action !== "reinstate") {
     res.status(400).json({ error: "invalid_action" });
     return;
@@ -597,7 +593,7 @@ app.post("/admin/orgs/:id/access", rateLimit("admin_export"), requireAdminServic
     return;
   }
   const orgId = String(req.params.id);
-  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  const adminId = actingAdminId(res);
   await setOrgAccess({ orgId, action, reason: String(reason ?? ""), source, changedByAdminId: adminId });
   const { rows } = await pool.query(
     "select id, state, access_status, access_reason, access_changed_at from orgs where id = $1",
@@ -608,24 +604,20 @@ app.post("/admin/orgs/:id/access", rateLimit("admin_export"), requireAdminServic
 
 // Org 360 read (A2) — lifecycle + access + admission (with submitted-at/elapsed) + team +
 // last-50 audit. References + status only (Modelo A). Plain read; NOT audited.
-app.get("/admin/orgs/:id", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+app.get("/admin/orgs/:id", rateLimit("admin_export"), async (req: Request, res: Response) => {
   res.json(await getOrgDetail(String(req.params.id)));
 });
 
 // Admission aging + latency (A3) — the pending queue (breach-flagged) + p50/p90/p95 latency.
 // Threshold is env.sla.admissionDays (wall-clock).
-app.get("/admin/admissions/aging", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
+app.get("/admin/admissions/aging", rateLimit("admin_export"), async (_req: Request, res: Response) => {
   res.json(await getAdmissionAging(env.sla.admissionDays));
 });
 
 // Export-audit sink (A1) — records that an admin exported rows (the CSV is built client-side).
-app.post("/admin/audit/export", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
-  const { adminClerkUserId, adminEmail, adminName, entity, filter, row_count } = req.body ?? {};
-  if (!adminClerkUserId || !adminEmail) {
-    res.status(400).json({ error: "missing_admin_identity" });
-    return;
-  }
-  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+app.post("/admin/audit/export", rateLimit("admin_export"), async (req: Request, res: Response) => {
+  const { entity, filter, row_count } = req.body ?? {};
+  const adminId = actingAdminId(res);
   await recordAuditExport({ adminId, entity: String(entity ?? ""), filter: filter ?? {}, rowCount: Number(row_count ?? 0) });
   res.json({ ok: true });
 });
@@ -634,12 +626,8 @@ app.post("/admin/audit/export", rateLimit("admin_export"), requireAdminServiceTo
 const APPROVAL_ACTION_TYPES = ["admission_relay", "org_block", "reversal", "role_grant"] as const;
 
 // Enqueue a gated action (requested_by = the acting admin). Executes on a peer's approval.
-app.post("/admin/approvals", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
-  const { adminClerkUserId, adminEmail, adminName, action_type, target_ref, payload } = req.body ?? {};
-  if (!adminClerkUserId || !adminEmail) {
-    res.status(400).json({ error: "missing_admin_identity" });
-    return;
-  }
+app.post("/admin/approvals", rateLimit("admin_export"), requireAdminRole("compliance"), async (req: Request, res: Response) => {
+  const { action_type, target_ref, payload } = req.body ?? {};
   if (!APPROVAL_ACTION_TYPES.includes(action_type)) {
     res.status(400).json({ error: "invalid_action_type" });
     return;
@@ -648,7 +636,7 @@ app.post("/admin/approvals", rateLimit("admin_export"), requireAdminServiceToken
     res.status(400).json({ error: "target_ref_required" });
     return;
   }
-  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  const adminId = actingAdminId(res);
   res.status(201).json(
     await enqueueApproval({
       requestedByAdminId: adminId,
@@ -660,23 +648,19 @@ app.post("/admin/approvals", rateLimit("admin_export"), requireAdminServiceToken
 });
 
 // Open approvals queue (oldest first) — drives the admin badge + queue view.
-app.get("/admin/approvals", rateLimit("admin_export"), requireAdminServiceToken, async (_req: Request, res: Response) => {
+app.get("/admin/approvals", rateLimit("admin_export"), async (_req: Request, res: Response) => {
   res.json({ approvals: await listOpenApprovals() });
 });
 
 // Decide an open approval. CAS + maker-checker (403) + already-decided (409); on approve,
 // the executor runs in the same txn (org_block wired; others 501).
-app.post("/admin/approvals/:id/decide", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
-  const { adminClerkUserId, adminEmail, adminName, decision, remark } = req.body ?? {};
-  if (!adminClerkUserId || !adminEmail) {
-    res.status(400).json({ error: "missing_admin_identity" });
-    return;
-  }
+app.post("/admin/approvals/:id/decide", rateLimit("admin_export"), requireAdminRole("compliance"), async (req: Request, res: Response) => {
+  const { decision, remark } = req.body ?? {};
   if (decision !== "approved" && decision !== "declined") {
     res.status(400).json({ error: "invalid_decision" });
     return;
   }
-  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+  const adminId = actingAdminId(res);
   res.json(
     await decideApproval({
       id: String(req.params.id),
@@ -689,13 +673,9 @@ app.post("/admin/approvals/:id/decide", rateLimit("admin_export"), requireAdminS
 
 // --- Admin compliance cases — service-token gated. Operational taxonomy only (AML absent).
 //     The customer-visibility wall lives in the service (messages.service messageCanBeCustomerVisible). ---
-app.post("/admin/cases", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
-  const { adminClerkUserId, adminEmail, adminName, org_id, type, priority, summary } = req.body ?? {};
-  if (!adminClerkUserId || !adminEmail) {
-    res.status(400).json({ error: "missing_admin_identity" });
-    return;
-  }
-  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+app.post("/admin/cases", rateLimit("admin_export"), requireAdminRole("compliance", "support"), async (req: Request, res: Response) => {
+  const { org_id, type, priority, summary } = req.body ?? {};
+  const adminId = actingAdminId(res);
   res.status(201).json(
     await createCase({
       orgId: org_id ? String(org_id) : null,
@@ -707,7 +687,7 @@ app.post("/admin/cases", rateLimit("admin_export"), requireAdminServiceToken, as
   );
 });
 
-app.get("/admin/cases", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+app.get("/admin/cases", rateLimit("admin_export"), async (req: Request, res: Response) => {
   res.json({
     cases: await listCases({
       type: req.query.type ? String(req.query.type) : undefined,
@@ -717,17 +697,13 @@ app.get("/admin/cases", rateLimit("admin_export"), requireAdminServiceToken, asy
   });
 });
 
-app.get("/admin/cases/:id", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+app.get("/admin/cases/:id", rateLimit("admin_export"), async (req: Request, res: Response) => {
   res.json(await getCaseDetail(String(req.params.id)));
 });
 
-app.post("/admin/cases/:id/messages", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
-  const { adminClerkUserId, adminEmail, adminName, body, customer_visible } = req.body ?? {};
-  if (!adminClerkUserId || !adminEmail) {
-    res.status(400).json({ error: "missing_admin_identity" });
-    return;
-  }
-  const adminId = await ensureAdminUser(String(adminClerkUserId), String(adminEmail), String(adminName ?? ""));
+app.post("/admin/cases/:id/messages", rateLimit("admin_export"), requireAdminRole("compliance", "support"), async (req: Request, res: Response) => {
+  const { body, customer_visible } = req.body ?? {};
+  const adminId = actingAdminId(res);
   res.status(201).json(
     await postAdminCaseMessage({
       caseId: String(req.params.id),
@@ -738,7 +714,7 @@ app.post("/admin/cases/:id/messages", rateLimit("admin_export"), requireAdminSer
   );
 });
 
-app.post("/admin/cases/:id/status", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+app.post("/admin/cases/:id/status", rateLimit("admin_export"), requireAdminRole("compliance", "support"), async (req: Request, res: Response) => {
   const { status, resolution } = req.body ?? {};
   res.json(
     await updateCaseStatus({
@@ -749,8 +725,18 @@ app.post("/admin/cases/:id/status", rateLimit("admin_export"), requireAdminServi
   );
 });
 
-app.post("/admin/cases/:id/assign", rateLimit("admin_export"), requireAdminServiceToken, async (req: Request, res: Response) => {
+app.post("/admin/cases/:id/assign", rateLimit("admin_export"), requireAdminRole("compliance", "support"), async (req: Request, res: Response) => {
   res.json(await assignCase(String(req.params.id), String(req.body?.assigned_admin_id ?? "")));
+});
+
+// --- Staff management (superadmin only) — the roster + role grants that make RBAC operable. ---
+app.get("/admin/admins", rateLimit("admin_export"), requireAdminRole(), async (_req: Request, res: Response) => {
+  res.json({ admins: await listAdmins() });
+});
+
+app.post("/admin/admins/:id/roles", rateLimit("admin_export"), requireAdminRole(), async (req: Request, res: Response) => {
+  const roles = Array.isArray(req.body?.roles) ? (req.body.roles as unknown[]).map(String) : [];
+  res.json(await setAdminRoles(String(req.params.id), roles, actingAdminId(res)));
 });
 
 // Error handler — Express 5 forwards rejected async handlers here.

@@ -76,6 +76,19 @@ export const env = {
   webhooks: {
     resendSecret: optional("RESEND_WEBHOOK_SECRET"),
   },
+  // Admin staff identity + RBAC (PRD-08 §5.1). When adminClerk.secretKey is set, the backend
+  // VERIFIES the admin's forwarded Clerk session token against the admin instance (binding the
+  // actor to a real session, not a body field) and enforces admin_users.roles per route. Unset =
+  // legacy body-trust with the documented limitation (dev). superadminEmails bootstrap the first
+  // superadmin(s) on verified first login. makerCheckerEnabled requires the verified path.
+  adminClerk: {
+    secretKey: optional("ADMIN_CLERK_SECRET_KEY"),
+    superadminEmails: (optional("ADMIN_SUPERADMIN_EMAILS") ?? "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  },
+  makerCheckerEnabled: process.env.MAKER_CHECKER_ENABLED === "true",
   // Shared secret for server-to-server /admin/* calls from the admin app (which
   // authenticates staff via its own, separate Clerk instance).
   adminServiceToken: optional("ADMIN_SERVICE_TOKEN"),
