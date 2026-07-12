@@ -47,6 +47,7 @@ import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/o
 import { ensureAveniaSubaccount, depositDetailsForOrg } from "./modules/onboarding/aveniaProvisioning.js";
 import { createDeposit, listTransactionsForOrg, reconcileInFlightDeposits, mapVendorFees } from "./modules/money/deposits.js";
 import { balancesForOrg } from "./modules/ledger/ledger.service.js";
+import { getRates, type RateQuoteFn } from "./modules/money/rates.service.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { requireStepUp } from "./modules/access/requireStepUp.js";
 import { requireMfaEnrolled } from "./modules/access/requireMfa.js";
@@ -332,6 +333,23 @@ app.get("/app/transactions", rateLimit("reads"), async (_req: Request, res: Resp
 // Ledger balances (minor units per currency) — settled money only, straight from postings.
 app.get("/app/balances", rateLimit("reads"), async (_req: Request, res: Response) => {
   res.json({ balances: await balancesForOrg(res.locals.orgId) });
+});
+
+// Display FX rates for the Câmbio board (BRL-USD both ways via BRLA<>USDT; BRL-EUR one way),
+// bare + mid-market-checked, ~30s cached. A GET quote — not the gated execution path. Degrades
+// to mid-market (or nulls) if Avenia's rate quote is unavailable.
+app.get("/app/rates", rateLimit("reads"), async (_req: Request, res: Response) => {
+  const { rows } = await pool.query<{ subaccount_id: string | null }>(
+    "select subaccount_id from avenia_accounts where org_id = $1",
+    [res.locals.orgId],
+  );
+  const sub = rows[0]?.subaccount_id ?? null;
+  const client = aveniaFromEnv();
+  const quote: RateQuoteFn =
+    sub && client
+      ? (i) => client.quoteRate({ subAccountId: sub, inputCurrency: i.inputCurrency, outputCurrency: i.outputCurrency })
+      : async () => null;
+  res.json(await getRates(sub ?? "none", quote));
 });
 
 // Beneficiaries — travel-rule capture (AUSTRAC §4 / 255033346). The customer captures payee

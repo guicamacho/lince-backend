@@ -62,6 +62,7 @@ export const ROUTE_CLASSMAP: Record<string, RouteClass> = {
   "POST /app/deposits": "beneficiary_write",
   "GET /app/transactions": "reads",
   "GET /app/balances": "reads",
+  "GET /app/rates": "reads",
   "GET /app/beneficiaries": "reads",
   "POST /app/beneficiaries": "beneficiary_write",
   "GET /app/team": "reads",

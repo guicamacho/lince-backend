@@ -187,6 +187,43 @@ export class AveniaClient implements RailProvider, SubAccountCreator, AccountInf
     throw new Error("STUB: Avenia quote gated on Wallets/Operations API mapping (BUILD_BRIEF §6)");
   }
 
+  /**
+   * DISPLAY-ONLY rate quote for a stablecoin pair (BRLA<>USDT, BRLA>EUR). A GET quote — no ticket,
+   * so it does NOT need the gated execution mapping. Returns the raw amounts so the caller derives
+   * an unambiguous rate (never crashes a dashboard read: any error/odd shape -> null). Best-effort
+   * INTERNAL/INTERNAL params; if the real sandbox differs the caller falls back to mid-market.
+   */
+  async quoteRate(input: {
+    subAccountId: string;
+    inputCurrency: string;
+    outputCurrency: string;
+    inputAmount?: string;
+  }): Promise<{ inputAmount: number; outputAmount: number } | null> {
+    try {
+      const q = new URLSearchParams({
+        inputCurrency: input.inputCurrency,
+        inputPaymentMethod: "INTERNAL",
+        outputCurrency: input.outputCurrency,
+        outputPaymentMethod: "INTERNAL",
+        inputAmount: input.inputAmount ?? "1000",
+        inputThirdParty: "false",
+        outputThirdParty: "false",
+        subAccountId: input.subAccountId,
+      });
+      const uri = `/v2/account/quote/fixed-rate?${q}`;
+      const res = await fetch(`${this.config.baseUrl}${uri}`, { headers: this.signedHeaders("GET", uri) });
+      if (!res.ok) return null;
+      const j = (await res.json()) as { inputAmount?: string; outputAmount?: string };
+      const inAmt = Number(j.inputAmount);
+      const outAmt = Number(j.outputAmount);
+      return Number.isFinite(inAmt) && inAmt > 0 && Number.isFinite(outAmt) && outAmt > 0
+        ? { inputAmount: inAmt, outputAmount: outAmt }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
   async createTicket(_input: { subAccountId: string; quoteToken: string }): Promise<Ticket> {
     // POST /v2/account/tickets?subAccountId=…  (lifecycle UNPAID->PROCESSING->PAID->FAILED)
     throw new Error("STUB: Avenia ticket gated on Wallets/Operations API mapping (BUILD_BRIEF §6)");
