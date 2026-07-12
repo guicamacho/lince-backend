@@ -5,11 +5,11 @@ import { getRates, _resetRatesCache, type RateQuoteFn } from "../src/modules/mon
 
 beforeEach(_resetRatesCache);
 
-// BRLA<>USDT ~ 5.4 BRL/USD, BRLA>EUR ~ 5.9 BRL/EUR. quote returns raw amounts (in/out).
+// quote returns the pair's bare BRL-per-unit basePrice. BRL/USD via USDT, BRL/EUR via EURC.
 const quote: RateQuoteFn = async ({ inputCurrency, outputCurrency }) => {
-  if (inputCurrency === "BRLA" && outputCurrency === "USDT") return { inputAmount: 1000, outputAmount: 184 }; // 1000/184=5.43 buy
-  if (inputCurrency === "USDT" && outputCurrency === "BRLA") return { inputAmount: 1000, outputAmount: 5380 }; // 5380/1000=5.38 sell
-  if (inputCurrency === "BRLA" && outputCurrency === "EUR") return { inputAmount: 1000, outputAmount: 169 }; // 1000/169=5.92 eur
+  if (inputCurrency === "BRLA" && outputCurrency === "USDT") return { price: 5.43 }; // buy USD
+  if (inputCurrency === "USDT" && outputCurrency === "BRLA") return { price: 5.38 }; // sell USD
+  if (inputCurrency === "BRLA" && outputCurrency === "EURC") return { price: 5.92 }; // EUR one way
   return null;
 };
 const mid = async () => ({ brlPerUsd: 5.4, brlPerEur: 5.9 });
@@ -26,7 +26,7 @@ test("derives BRL-per-unit buy/sell + one-way EUR from raw amounts, within the s
 test("an Avenia rate far from mid-market is dropped (suspect), mid still shown", async () => {
   _resetRatesCache();
   const brokenQuote: RateQuoteFn = async ({ inputCurrency, outputCurrency }) =>
-    inputCurrency === "BRLA" && outputCurrency === "USDT" ? { inputAmount: 1000, outputAmount: 500 } : null; // 2.0, way off 5.4
+    inputCurrency === "BRLA" && outputCurrency === "USDT" ? { price: 2.0 } : null; // way off 5.4
   const r = await getRates("s", brokenQuote, mid, () => 2000);
   assert.equal(r.brlUsd.buy, null); // dropped, not displayed as real
   assert.equal(r.brlUsd.mid, 5.4); // reference still there

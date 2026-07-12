@@ -20,12 +20,13 @@ export interface Rates {
   updatedAt: string;
 }
 
-/** A quote fn (injected; the AveniaClient.quoteRate in prod) returning raw amounts or null. */
+/** A quote fn (injected; the AveniaClient.quoteRate in prod) returning the pair's bare BRL-per-unit
+ *  price (Avenia basePrice) or null. */
 export type RateQuoteFn = (input: {
   subAccountId: string;
   inputCurrency: string;
   outputCurrency: string;
-}) => Promise<{ inputAmount: number; outputAmount: number } | null>;
+}) => Promise<{ price: number } | null>;
 
 /** Mid-market fetch (injected): BRL per USD and BRL per EUR, or nulls. */
 export type MidMarketFn = () => Promise<{ brlPerUsd: number | null; brlPerEur: number | null }>;
@@ -70,14 +71,16 @@ export async function getRates(
   const [usdBuy, usdSell, eurBuy, mid] = await Promise.all([
     quote({ subAccountId, inputCurrency: "BRLA", outputCurrency: "USDT" }), // BRL -> USD (buy USD)
     quote({ subAccountId, inputCurrency: "USDT", outputCurrency: "BRLA" }), // USD -> BRL (sell USD)
-    quote({ subAccountId, inputCurrency: "BRLA", outputCurrency: "EUR" }), //  BRL -> EUR (one way)
+    quote({ subAccountId, inputCurrency: "BRLA", outputCurrency: "EURC" }), // BRL -> EUR one way (EURC proxy)
     midMarket(),
   ]);
 
-  // BRL per unit: for BRLA->X, in/out = BRL per unit; for X->BRLA, out/in = BRL per unit.
-  const usdBuyRate = usdBuy ? usdBuy.inputAmount / usdBuy.outputAmount : null;
-  const usdSellRate = usdSell ? usdSell.outputAmount / usdSell.inputAmount : null;
-  const eurBuyRate = eurBuy ? eurBuy.inputAmount / eurBuy.outputAmount : null;
+  // basePrice is already BRL per foreign unit (pair is quoted FOREIGN/BRLA both ways), so it maps
+  // straight through — no division, no direction juggling. The sane-band check vs mid catches any
+  // future inversion.
+  const usdBuyRate = usdBuy ? usdBuy.price : null;
+  const usdSellRate = usdSell ? usdSell.price : null;
+  const eurBuyRate = eurBuy ? eurBuy.price : null;
 
   const rates: Rates = {
     brlUsd: {

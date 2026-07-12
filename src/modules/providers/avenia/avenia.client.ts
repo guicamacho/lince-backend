@@ -188,17 +188,23 @@ export class AveniaClient implements RailProvider, SubAccountCreator, AccountInf
   }
 
   /**
-   * DISPLAY-ONLY rate quote for a stablecoin pair (BRLA<>USDT, BRLA>EUR). A GET quote — no ticket,
-   * so it does NOT need the gated execution mapping. Returns the raw amounts so the caller derives
-   * an unambiguous rate (never crashes a dashboard read: any error/odd shape -> null). Best-effort
-   * INTERNAL/INTERNAL params; if the real sandbox differs the caller falls back to mid-market.
+   * DISPLAY-ONLY rate quote for a stablecoin pair (BRLA<>USDT for BRL/USD, BRLA>EURC for BRL/EUR).
+   * A GET quote — no ticket — so it does NOT need the gated execution mapping. Returns the pair's
+   * BARE `basePrice` (BRL per foreign unit, fee-free — the "sem tarifas" reference; the fee-laden
+   * effective rate lives in inputAmount/outputAmount instead). Never crashes a dashboard read: any
+   * error/odd shape -> null and the caller falls back to mid-market.
+   *
+   * Verified against the sandbox 2026-07-12: these are blockchain-settled pairs, so the quote
+   * REQUIRES blockchainSendMethod (400 "…:blockchainSendMethod is invalid" without it); fiat EUR
+   * output is rejected outright, which is why the EUR leg quotes EURC (the euro-coin), mirroring
+   * USDT for USD.
    */
   async quoteRate(input: {
     subAccountId: string;
     inputCurrency: string;
     outputCurrency: string;
     inputAmount?: string;
-  }): Promise<{ inputAmount: number; outputAmount: number } | null> {
+  }): Promise<{ price: number } | null> {
     try {
       const q = new URLSearchParams({
         inputCurrency: input.inputCurrency,
@@ -208,17 +214,15 @@ export class AveniaClient implements RailProvider, SubAccountCreator, AccountInf
         inputAmount: input.inputAmount ?? "1000",
         inputThirdParty: "false",
         outputThirdParty: "false",
+        blockchainSendMethod: "PERMIT",
         subAccountId: input.subAccountId,
       });
       const uri = `/v2/account/quote/fixed-rate?${q}`;
       const res = await fetch(`${this.config.baseUrl}${uri}`, { headers: this.signedHeaders("GET", uri) });
       if (!res.ok) return null;
-      const j = (await res.json()) as { inputAmount?: string; outputAmount?: string };
-      const inAmt = Number(j.inputAmount);
-      const outAmt = Number(j.outputAmount);
-      return Number.isFinite(inAmt) && inAmt > 0 && Number.isFinite(outAmt) && outAmt > 0
-        ? { inputAmount: inAmt, outputAmount: outAmt }
-        : null;
+      const j = (await res.json()) as { basePrice?: string };
+      const price = Number(j.basePrice);
+      return Number.isFinite(price) && price > 0 ? { price } : null;
     } catch {
       return null;
     }
