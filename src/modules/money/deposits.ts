@@ -185,8 +185,8 @@ export async function createDeposit(
 export async function reconcileInFlightDeposits(rail: TicketReader, quietSeconds = 45, limit = 10): Promise<number> {
   // Includes 'created' rows with a NULL vendor_ref: these are crash-orphans (ticket live at
   // Avenia, id never persisted). We recover them by externalId (= idem_key) below.
-  const { rows } = await pool.query<{ id: string; vendor_ref: string | null; idem_key: string; subaccount_id: string | null }>(
-    `select t.id, t.vendor_ref, t.idem_key::text as idem_key, a.subaccount_id
+  const { rows } = await pool.query<{ id: string; vendor_ref: string | null; idem_key: string; subaccount_id: string | null; dest_currency: string | null }>(
+    `select t.id, t.vendor_ref, t.idem_key::text as idem_key, a.subaccount_id, t.dest_currency
        from org_transactions t
        left join avenia_accounts a on a.org_id = t.org_id
       where t.provider_code = 'avenia'
@@ -207,7 +207,19 @@ export async function reconcileInFlightDeposits(rail: TicketReader, quietSeconds
     } catch {
       continue; // transient Avenia error — next pass retries
     }
-    if (!ticket) continue; // orphan with no ticket at Avenia (create never happened) — leave it
+    if (!ticket) {
+      // No ticket at Avenia. A null-vendor_ref 'created' row never got one (create never reached
+      // Avenia), so nothing executed — release it, or a convert's reservation would hold the
+      // customer's balance forever. A vendor_ref row is a transient lookup miss: keep polling.
+      if (!r.vendor_ref) {
+        await pool.query(
+          `update org_transactions set state = 'failed', error = $2, updated_at = now()
+             where id = $1 and state = 'created'`,
+          [r.id, JSON.stringify({ stage: "reconcile", message: "no ticket at avenia (externalId not found)" })],
+        );
+      }
+      continue;
+    }
     await withTransaction(async (c) => {
       const locked = await c.query<ApplyRow>(
         `select ${APPLY_ROW_COLUMNS} from org_transactions where id = $1 for update`,
@@ -217,7 +229,8 @@ export async function reconcileInFlightDeposits(rail: TicketReader, quietSeconds
       // Backfill a recovered orphan's vendor_ref + dest_amount before applying status, so the
       // settle posting has the credited amount.
       if (!r.vendor_ref) {
-        const dest = ticket.outputAmount ? vendorMinor(ticket.outputAmount, "BRLA") : null;
+        // dest currency is per-row: BRLA for a deposit, the target coin for a convert orphan.
+        const dest = ticket.outputAmount ? vendorMinor(ticket.outputAmount, (r.dest_currency ?? "BRLA") as Currency) : null;
         await c.query(
           `update org_transactions set vendor_ref = $2, dest_amount = coalesce(dest_amount, $3), updated_at = now() where id = $1`,
           [r.id, ticket.id, dest],

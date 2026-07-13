@@ -50,6 +50,30 @@ export interface DepositRail {
   createPixDeposit(input: { subAccountId: string; amountBrl: string; externalId?: string }): Promise<AveniaDepositResult>;
 }
 
+/** Internal currency swap (Convert, PRD-10). Same quote->ticket primitive as a deposit, output
+ *  INTERNAL so the result stays in the subaccount wallet. Confirmed live 2026-07-12 (settles PAID). */
+export interface AveniaSwapResult {
+  ticketId: string;
+  quote: {
+    inputCurrency: string;
+    inputAmount: string;
+    outputCurrency: string;
+    outputAmount: string;
+    basePrice: string;
+    pairName: string;
+    appliedFees: Array<{ type: string; amount: string; currency: string; rebatable: boolean; description?: string }>;
+  };
+}
+export interface SwapRail {
+  createSwap(input: {
+    subAccountId: string;
+    inputCurrency: string;
+    outputCurrency: string;
+    inputAmount: string;
+    externalId?: string;
+  }): Promise<AveniaSwapResult>;
+}
+
 export interface TicketView {
   id: string;
   status: string;
@@ -63,7 +87,7 @@ export interface TicketReader {
   findTicketByExternalId(input: { subAccountId: string; externalId: string }): Promise<TicketView | null>;
 }
 
-export class AveniaClient implements RailProvider, SubAccountCreator, AccountInfoReader, DepositRail, TicketReader {
+export class AveniaClient implements RailProvider, SubAccountCreator, AccountInfoReader, DepositRail, SwapRail, TicketReader {
   constructor(private readonly config: AveniaConfig) {}
 
   /** One ticket's current status — the reconciler's poll (subAccountId must match the
@@ -226,6 +250,64 @@ export class AveniaClient implements RailProvider, SubAccountCreator, AccountInf
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Internal currency swap (Convert). Real execution: GET fixed-rate quote (INTERNAL/INTERNAL,
+   * blockchainSendMethod=PERMIT for the crypto legs) -> POST ticket with the deposit-style body
+   * (INTERNAL output stays in the subaccount wallet). externalId = our idem_key for vendor-side
+   * idempotency + orphan recovery, exactly like createPixDeposit. Throws on any non-2xx.
+   */
+  async createSwap(input: {
+    subAccountId: string;
+    inputCurrency: string;
+    outputCurrency: string;
+    inputAmount: string;
+    externalId?: string;
+  }): Promise<AveniaSwapResult> {
+    const q = new URLSearchParams({
+      inputCurrency: input.inputCurrency,
+      inputPaymentMethod: "INTERNAL",
+      outputCurrency: input.outputCurrency,
+      outputPaymentMethod: "INTERNAL",
+      inputAmount: input.inputAmount,
+      inputThirdParty: "false",
+      outputThirdParty: "false",
+      blockchainSendMethod: "PERMIT",
+      subAccountId: input.subAccountId,
+    });
+    const quoteUri = `/v2/account/quote/fixed-rate?${q}`;
+    const quoteRes = await fetch(`${this.config.baseUrl}${quoteUri}`, { headers: this.signedHeaders("GET", quoteUri) });
+    if (!quoteRes.ok) throw new Error(`avenia swap quote ${quoteRes.status}: ${(await quoteRes.text()).slice(0, 200)}`);
+    const quote = (await quoteRes.json()) as AveniaSwapResult["quote"] & { quoteToken?: string };
+    if (!quote.quoteToken) throw new Error("avenia swap quote: no quoteToken");
+
+    const ticketUri = `/v2/account/tickets/?subAccountId=${encodeURIComponent(input.subAccountId)}`;
+    const body = JSON.stringify({
+      quoteToken: quote.quoteToken,
+      ticketBlockchainOutput: { beneficiaryWalletId: "00000000-0000-0000-0000-000000000000" },
+      ...(input.externalId ? { externalId: input.externalId } : {}),
+    });
+    const ticketRes = await fetch(`${this.config.baseUrl}${ticketUri}`, {
+      method: "POST",
+      headers: this.signedHeaders("POST", ticketUri, body),
+      body,
+    });
+    if (!ticketRes.ok) throw new Error(`avenia swap ticket ${ticketRes.status}: ${(await ticketRes.text()).slice(0, 200)}`);
+    const ticket = (await ticketRes.json()) as { id?: string };
+    if (!ticket.id) throw new Error("avenia swap ticket: no id");
+    return {
+      ticketId: ticket.id,
+      quote: {
+        inputCurrency: quote.inputCurrency,
+        inputAmount: quote.inputAmount,
+        outputCurrency: quote.outputCurrency,
+        outputAmount: quote.outputAmount,
+        basePrice: quote.basePrice,
+        pairName: quote.pairName,
+        appliedFees: quote.appliedFees ?? [],
+      },
+    };
   }
 
   async createTicket(_input: { subAccountId: string; quoteToken: string }): Promise<Ticket> {

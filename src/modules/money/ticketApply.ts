@@ -33,12 +33,14 @@ export interface ApplyRow {
   id: string;
   org_id: string;
   type: string;
+  source_currency: string | null;
+  source_amount: string | null; // bigint comes back as string from pg
   dest_currency: string | null;
-  dest_amount: string | null; // bigint comes back as string from pg
+  dest_amount: string | null;
   quote: { ticketStatus?: string } | null;
 }
 
-export const APPLY_ROW_COLUMNS = "id, org_id, type, dest_currency, dest_amount, quote";
+export const APPLY_ROW_COLUMNS = "id, org_id, type, source_currency, source_amount, dest_currency, dest_amount, quote";
 
 /** Apply a wire-format ticket status to a locked org_transactions row. Returns what happened. */
 export async function applyTicketStatus(
@@ -82,6 +84,40 @@ export async function applyTicketStatus(
       // Already posted for this deposit (in-code guard regressed / raced): the state UPDATE
       // above is idempotent, so swallow and treat as applied — never double-credit the ledger.
       if (!(e instanceof DuplicateLedgerPostError)) throw e;
+    }
+  }
+
+  // Convert settle (PRD-10): a swap reshapes existing custody — the customer gives up `in` of the
+  // source currency and receives `out` of the destination. Four postings, balanced PER CURRENCY:
+  //   src: -in custody (vendor holds less src)   +in  org liability (customer holds less src)
+  //   dst: +out custody (vendor holds more dst)  -out org liability (customer holds more dst)
+  // Amounts are the ticket ACTUALS (fees baked in, as with deposits). Markup income leg = PRD-09.
+  if (
+    nextState === "settled" && tx.type === "convert_and_send" &&
+    tx.source_amount && tx.source_currency && tx.dest_amount && tx.dest_currency
+  ) {
+    const srcCcy = tx.source_currency as Currency;
+    const dstCcy = tx.dest_currency as Currency;
+    const inAmt = BigInt(tx.source_amount);
+    const outAmt = BigInt(tx.dest_amount);
+    const custodySrc = await ensureAccount(client, { key: `avenia:custody:${srcCcy}`, type: "vendor_asset", currency: srcCcy });
+    const custodyDst = await ensureAccount(client, { key: `avenia:custody:${dstCcy}`, type: "vendor_asset", currency: dstCcy });
+    const orgSrc = await ensureAccount(client, { key: `org:${tx.org_id}:${srcCcy}`, type: "customer_liability", orgId: tx.org_id, currency: srcCcy });
+    const orgDst = await ensureAccount(client, { key: `org:${tx.org_id}:${dstCcy}`, type: "customer_liability", orgId: tx.org_id, currency: dstCcy });
+    try {
+      await postBalancedTransactionOn(client, {
+        description: `convert settled (ticket actuals)`,
+        orgTransactionId: tx.id,
+        idempotencyKey: `convert-settle:${tx.id}`,
+        postings: [
+          { accountId: custodySrc, amount: -inAmt, currency: srcCcy },
+          { accountId: orgSrc, amount: inAmt, currency: srcCcy },
+          { accountId: custodyDst, amount: outAmt, currency: dstCcy },
+          { accountId: orgDst, amount: -outAmt, currency: dstCcy },
+        ],
+      });
+    } catch (e) {
+      if (!(e instanceof DuplicateLedgerPostError)) throw e; // idempotent replay — never double-post
     }
   }
   return "apply";

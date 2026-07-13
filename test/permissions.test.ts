@@ -9,8 +9,10 @@ test("role matrix enforced exactly (PRD-03 §1)", () => {
   assert.equal(can(["viewer"], "manage_beneficiaries"), false);
   assert.equal(can(["viewer"], "initiate_payout"), false);
   assert.equal(can(["viewer"], "manage_team"), false);
+  assert.equal(can(["viewer"], "respond_cases"), false); // read-only: no compliance-thread writes
   // finance: moves money, nothing else
   assert.equal(can(["finance"], "initiate_payout"), true);
+  assert.equal(can(["finance"], "respond_cases"), true);
   assert.equal(can(["finance"], "manage_beneficiaries"), true);
   assert.equal(can(["finance"], "manage_team"), false);
   assert.equal(can(["finance"], "enable_rails"), false);

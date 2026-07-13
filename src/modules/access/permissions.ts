@@ -16,6 +16,7 @@ export type Permission =
   | "view_transactions"
   | "manage_beneficiaries"
   | "initiate_payout"
+  | "respond_cases"
   | "enable_rails"
   | "manage_team"
   | "manage_roles"
@@ -34,6 +35,7 @@ const MATRIX: Record<Permission, readonly AccessRole[]> = {
   view_transactions: ALL,
   manage_beneficiaries: MONEY,
   initiate_payout: MONEY,
+  respond_cases: MONEY, // reply to compliance/RFI threads + upload docs — never the read-only viewer
   enable_rails: OWNER_ADMIN,
   manage_team: OWNER_ADMIN,
   manage_roles: OWNER_ADMIN,

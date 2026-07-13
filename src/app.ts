@@ -46,6 +46,7 @@ import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
 import { ensureAveniaSubaccount, depositDetailsForOrg } from "./modules/onboarding/aveniaProvisioning.js";
 import { createDeposit, listTransactionsForOrg, reconcileInFlightDeposits, mapVendorFees } from "./modules/money/deposits.js";
+import { createConvert } from "./modules/money/convert.js";
 import { balancesForOrg } from "./modules/ledger/ledger.service.js";
 import { getRates, type RateQuoteFn } from "./modules/money/rates.service.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
@@ -94,6 +95,7 @@ if (!env.adminClerk.secretKey) {
 }
 
 export const app = express();
+app.disable("x-powered-by"); // don't advertise the framework (pentest 2026-07-13)
 // Trust exactly N proxy hops (Cloudflare tunnel + Fly) so req.ip is the real client IP for
 // rate limiting. Set via TRUST_PROXY_HOPS per environment; 0 in dev (no proxy). Never `true`.
 app.set("trust proxy", env.rateLimit.trustProxyHops);
@@ -193,10 +195,17 @@ app.get("/onboarding/state", rateLimit("reads"), async (req: Request, res: Respo
   res.json(org);
 });
 
+// The mock KYB endpoints (launch + self-complete) exist ONLY while Didit is mocked, which we
+// tie to the Avenia SANDBOX base URL: any environment on production keys (staging/prod) is not
+// sandbox, so these 404 there — no user can fabricate a "KYB done" signal, and there is no flag
+// to forget (pentest 2026-07-13, HIGH). Real Didit hosted capture replaces both at cutover.
+const MOCK_KYB = env.avenia.baseUrl.includes("sandbox");
+
 // "Start verification": Avenia COMPANY subaccount first (Connectivity §3 — KYB runs
 // against it), then launch Didit (mocked) -> kyb_in_progress. ensure* is idempotent,
 // so the RFI re-launch path reuses the existing subaccount.
 app.post("/onboarding/launch-verification", rateLimit("signup_start"), async (req: Request, res: Response) => {
+  if (!MOCK_KYB) { res.status(404).json({ error: "not_found" }); return; }
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
   const current = await currentOrgForClerkUser(uid);
@@ -210,8 +219,9 @@ app.post("/onboarding/launch-verification", rateLimit("signup_start"), async (re
   res.json({ ...snap, hostedUrl: session.hostedUrl });
 });
 
-// Mock Didit complete + forward to Avenia -> vendor_pending (under review).
+// Mock Didit complete + forward to Avenia -> vendor_pending (under review). Sandbox-only (MOCK_KYB).
 app.post("/onboarding/mock-verify", rateLimit("signup_start"), async (req: Request, res: Response) => {
+  if (!MOCK_KYB) { res.status(404).json({ error: "not_found" }); return; }
   const uid = requireClerkUserId(req, res);
   if (!uid) return;
   res.json(await advanceCallerOrg(uid, "vendor_pending"));
@@ -325,6 +335,29 @@ app.post("/app/deposits", rateLimit("beneficiary_write"), requirePermission("ini
   );
 });
 
+// Convert (PRD-10): standalone currency swap of the customer's own balance (BRL<->USD via
+// BRLA<->USDT). Money movement — 'ticket' rate class, initiate_payout permission, step-up +
+// MFA claim. Two-phase reservation under the org money lock lives in createConvert.
+app.post(
+  "/app/convert",
+  rateLimit("ticket"),
+  requirePermission("initiate_payout"),
+  requireStepUp(env.stepUp.enforced),
+  requireMfaEnrolled(),
+  async (req: Request, res: Response) => {
+    const { from, to, amount, idemKey } = (req.body ?? {}) as {
+      from?: string; to?: string; amount?: string; idemKey?: string;
+    };
+    if (!from || !to || !amount || !idemKey) {
+      res.status(422).json({ error: "from_to_amount_idemKey_required" });
+      return;
+    }
+    res.status(201).json(
+      await createConvert(res.locals.orgId, res.locals.personId ?? null, { from, to, amount, idemKey }, aveniaFromEnv()),
+    );
+  },
+);
+
 // Transaction list — the frozen contract the F3 Transações UI was built against.
 app.get("/app/transactions", rateLimit("reads"), async (_req: Request, res: Response) => {
   res.json({ transactions: await listTransactionsForOrg(res.locals.orgId) });
@@ -411,6 +444,7 @@ app.post(
   rateLimit("beneficiary_write"),
   requirePermission("transfer_ownership"),
   requireStepUp(env.stepUp.enforced),
+  requireMfaEnrolled(), // always-on 2FA claim, like beneficiaries (pentest 2026-07-13)
   async (req: Request, res: Response) => {
     const to = String((req.body as { toPersonId?: unknown } | null)?.toPersonId ?? "");
     await transferOwnership(res.locals.orgId, res.locals.personId, to);
@@ -438,7 +472,8 @@ app.get("/app/cases/:id/messages", rateLimit("reads"), async (req: Request, res:
 });
 
 // Reply-only (D1): customers reply to a staff-opened case, they do not open cases in v1.
-app.post("/app/cases/:id/messages", rateLimit("beneficiary_write"), async (req: Request, res: Response) => {
+// respond_cases excludes the read-only viewer (pentest 2026-07-13).
+app.post("/app/cases/:id/messages", rateLimit("beneficiary_write"), requirePermission("respond_cases"), async (req: Request, res: Response) => {
   const { userId } = getAuth(req);
   res.status(201).json(
     await postCustomerCaseReply(res.locals.orgId, userId, String(req.params.id), String(req.body?.body ?? "")),
@@ -458,6 +493,7 @@ app.get("/app/cases/:id/documents", rateLimit("reads"), async (req: Request, res
 app.post(
   "/app/cases/:id/documents",
   rateLimit("beneficiary_write"),
+  requirePermission("respond_cases"), // not the read-only viewer (pentest 2026-07-13)
   express.raw({ type: "application/octet-stream", limit: MAX_DOC_BYTES }),
   async (req: Request, res: Response) => {
     const doc = await submitDocument(
