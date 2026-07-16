@@ -98,6 +98,9 @@ export interface TicketReader {
   findTicketByExternalId(input: { subAccountId: string; externalId: string }): Promise<TicketView | null>;
 }
 
+/** Nil-UUID beneficiaryWalletId = "credit this subaccount's own wallet". */
+const OWN_WALLET = { beneficiaryWalletId: "00000000-0000-0000-0000-000000000000" };
+
 export class AveniaClient implements SubAccountCreator, AccountInfoReader, DepositRail, SwapRail, PayoutRail, TicketReader {
   constructor(private readonly config: AveniaConfig) {}
 
@@ -126,53 +129,21 @@ export class AveniaClient implements SubAccountCreator, AccountInfoReader, Depos
    *  Returns the brCode the customer pays; nothing moves until it's paid. The nil-UUID
    *  beneficiaryWalletId means "this subaccount" — resolved from subAccountId at quote time. */
   async createPixDeposit(input: { subAccountId: string; amountBrl: string; externalId?: string }): Promise<AveniaDepositResult> {
-    const q = new URLSearchParams({
-      inputCurrency: "BRL",
-      inputPaymentMethod: "PIX",
-      outputCurrency: "BRLA",
-      outputPaymentMethod: "INTERNAL",
-      inputAmount: input.amountBrl,
-      inputThirdParty: "false",
-      outputThirdParty: "false",
-      blockchainSendMethod: "PERMIT",
+    const { ticket, quote } = await this.quoteAndTicket({
       subAccountId: input.subAccountId,
-    });
-    const quoteUri = `/v2/account/quote/fixed-rate?${q}`;
-    const quoteRes = await fetch(`${this.config.baseUrl}${quoteUri}`, { headers: this.signedHeaders("GET", quoteUri) });
-    if (!quoteRes.ok) throw new Error(`avenia quote ${quoteRes.status}: ${(await quoteRes.text()).slice(0, 200)}`);
-    const quote = (await quoteRes.json()) as AveniaDepositResult["quote"] & { quoteToken?: string };
-    if (!quote.quoteToken) throw new Error("avenia quote: no quoteToken");
-
-    const ticketUri = `/v2/account/tickets/?subAccountId=${encodeURIComponent(input.subAccountId)}`;
-    const body = JSON.stringify({
-      quoteToken: quote.quoteToken,
-      ticketBlockchainOutput: { beneficiaryWalletId: "00000000-0000-0000-0000-000000000000" },
-      // Vendor idempotency: our idem_key. A retry with the same key won't create a duplicate
-      // ticket, and lets the reconciler recover a ticket whose id we failed to persist.
-      ...(input.externalId ? { externalId: input.externalId } : {}),
-    });
-    const ticketRes = await fetch(`${this.config.baseUrl}${ticketUri}`, {
-      method: "POST",
-      headers: this.signedHeaders("POST", ticketUri, body),
-      body,
-    });
-    if (!ticketRes.ok) throw new Error(`avenia ticket ${ticketRes.status}: ${(await ticketRes.text()).slice(0, 200)}`);
-    const ticket = (await ticketRes.json()) as { id?: string; brCode?: string; expiration?: string };
-    if (!ticket.id || !ticket.brCode) throw new Error("avenia ticket: missing id/brCode");
-    return {
-      ticketId: ticket.id,
-      brCode: ticket.brCode,
-      expiration: ticket.expiration ?? "",
+      label: "deposit",
       quote: {
-        inputCurrency: quote.inputCurrency,
-        inputAmount: quote.inputAmount,
-        outputCurrency: quote.outputCurrency,
-        outputAmount: quote.outputAmount,
-        basePrice: quote.basePrice,
-        pairName: quote.pairName,
-        appliedFees: quote.appliedFees ?? [],
+        inputCurrency: "BRL",
+        inputPaymentMethod: "PIX",
+        outputCurrency: "BRLA",
+        outputPaymentMethod: "INTERNAL",
+        inputAmount: input.amountBrl,
       },
-    };
+      ticketOutput: { ticketBlockchainOutput: OWN_WALLET },
+      externalId: input.externalId,
+    });
+    if (!ticket.brCode) throw new Error("avenia deposit ticket: missing brCode");
+    return { ticketId: ticket.id, brCode: ticket.brCode, expiration: ticket.expiration ?? "", quote };
   }
 
   /** Account info (wallets + PIX key/brCode). Scoped to a subaccount when given,
@@ -210,6 +181,67 @@ export class AveniaClient implements SubAccountCreator, AccountInfoReader, Depos
       body,
       privateKeyPem: this.config.signingPrivateKeyPem,
     });
+  }
+
+  /**
+   * The one quote -> ticket primitive every money rail rides: GET fixed-rate (quoteToken lives
+   * ~15s) then POST /v2/account/tickets/ (TRAILING SLASH — part of the signed URI) with the
+   * rail's output body. externalId = our idem_key for vendor-side idempotency + orphan
+   * recovery. Throws on any non-2xx; a ticket may auto-execute the instant it is POSTed, so
+   * money-out callers must never mark 'failed' on a lost response (see convert.ts).
+   */
+  private async quoteAndTicket(input: {
+    subAccountId: string;
+    label: string; // error-message prefix: deposit | swap | payout
+    quote: {
+      inputCurrency: string;
+      inputPaymentMethod: string;
+      outputCurrency: string;
+      outputPaymentMethod: string;
+      inputAmount: string;
+    };
+    ticketOutput: Record<string, unknown>;
+    externalId?: string;
+  }): Promise<{ ticket: { id: string; brCode?: string; expiration?: string }; quote: AveniaSwapResult["quote"] }> {
+    const q = new URLSearchParams({
+      ...input.quote,
+      inputThirdParty: "false",
+      outputThirdParty: "false",
+      blockchainSendMethod: "PERMIT", // required on blockchain-settled pairs (400 without it)
+      subAccountId: input.subAccountId,
+    });
+    const quoteUri = `/v2/account/quote/fixed-rate?${q}`;
+    const quoteRes = await fetch(`${this.config.baseUrl}${quoteUri}`, { headers: this.signedHeaders("GET", quoteUri) });
+    if (!quoteRes.ok) throw new Error(`avenia ${input.label} quote ${quoteRes.status}: ${(await quoteRes.text()).slice(0, 200)}`);
+    const quote = (await quoteRes.json()) as AveniaSwapResult["quote"] & { quoteToken?: string };
+    if (!quote.quoteToken) throw new Error(`avenia ${input.label} quote: no quoteToken`);
+
+    const ticketUri = `/v2/account/tickets/?subAccountId=${encodeURIComponent(input.subAccountId)}`;
+    const body = JSON.stringify({
+      quoteToken: quote.quoteToken,
+      ...input.ticketOutput,
+      ...(input.externalId ? { externalId: input.externalId } : {}),
+    });
+    const ticketRes = await fetch(`${this.config.baseUrl}${ticketUri}`, {
+      method: "POST",
+      headers: this.signedHeaders("POST", ticketUri, body),
+      body,
+    });
+    if (!ticketRes.ok) throw new Error(`avenia ${input.label} ticket ${ticketRes.status}: ${(await ticketRes.text()).slice(0, 200)}`);
+    const ticket = (await ticketRes.json()) as { id?: string; brCode?: string; expiration?: string };
+    if (!ticket.id) throw new Error(`avenia ${input.label} ticket: no id`);
+    return {
+      ticket: { id: ticket.id, brCode: ticket.brCode, expiration: ticket.expiration },
+      quote: {
+        inputCurrency: quote.inputCurrency,
+        inputAmount: quote.inputAmount,
+        outputCurrency: quote.outputCurrency,
+        outputAmount: quote.outputAmount,
+        basePrice: quote.basePrice,
+        pairName: quote.pairName,
+        appliedFees: quote.appliedFees ?? [],
+      },
+    };
   }
 
   /**
@@ -266,49 +298,20 @@ export class AveniaClient implements SubAccountCreator, AccountInfoReader, Depos
     inputAmount: string;
     externalId?: string;
   }): Promise<AveniaSwapResult> {
-    const q = new URLSearchParams({
-      inputCurrency: input.inputCurrency,
-      inputPaymentMethod: "INTERNAL",
-      outputCurrency: input.outputCurrency,
-      outputPaymentMethod: "INTERNAL",
-      inputAmount: input.inputAmount,
-      inputThirdParty: "false",
-      outputThirdParty: "false",
-      blockchainSendMethod: "PERMIT",
+    const { ticket, quote } = await this.quoteAndTicket({
       subAccountId: input.subAccountId,
-    });
-    const quoteUri = `/v2/account/quote/fixed-rate?${q}`;
-    const quoteRes = await fetch(`${this.config.baseUrl}${quoteUri}`, { headers: this.signedHeaders("GET", quoteUri) });
-    if (!quoteRes.ok) throw new Error(`avenia swap quote ${quoteRes.status}: ${(await quoteRes.text()).slice(0, 200)}`);
-    const quote = (await quoteRes.json()) as AveniaSwapResult["quote"] & { quoteToken?: string };
-    if (!quote.quoteToken) throw new Error("avenia swap quote: no quoteToken");
-
-    const ticketUri = `/v2/account/tickets/?subAccountId=${encodeURIComponent(input.subAccountId)}`;
-    const body = JSON.stringify({
-      quoteToken: quote.quoteToken,
-      ticketBlockchainOutput: { beneficiaryWalletId: "00000000-0000-0000-0000-000000000000" },
-      ...(input.externalId ? { externalId: input.externalId } : {}),
-    });
-    const ticketRes = await fetch(`${this.config.baseUrl}${ticketUri}`, {
-      method: "POST",
-      headers: this.signedHeaders("POST", ticketUri, body),
-      body,
-    });
-    if (!ticketRes.ok) throw new Error(`avenia swap ticket ${ticketRes.status}: ${(await ticketRes.text()).slice(0, 200)}`);
-    const ticket = (await ticketRes.json()) as { id?: string };
-    if (!ticket.id) throw new Error("avenia swap ticket: no id");
-    return {
-      ticketId: ticket.id,
+      label: "swap",
       quote: {
-        inputCurrency: quote.inputCurrency,
-        inputAmount: quote.inputAmount,
-        outputCurrency: quote.outputCurrency,
-        outputAmount: quote.outputAmount,
-        basePrice: quote.basePrice,
-        pairName: quote.pairName,
-        appliedFees: quote.appliedFees ?? [],
+        inputCurrency: input.inputCurrency,
+        inputPaymentMethod: "INTERNAL",
+        outputCurrency: input.outputCurrency,
+        outputPaymentMethod: "INTERNAL",
+        inputAmount: input.inputAmount,
       },
-    };
+      ticketOutput: { ticketBlockchainOutput: OWN_WALLET },
+      externalId: input.externalId,
+    });
+    return { ticketId: ticket.id, quote };
   }
 
   /** Register a BRL PIX beneficiary bank account under the subaccount. NOTE the collection
@@ -341,51 +344,21 @@ export class AveniaClient implements SubAccountCreator, AccountInfoReader, Depos
     beneficiaryBrlBankAccountId: string;
     externalId?: string;
   }): Promise<AveniaSwapResult> {
-    const q = new URLSearchParams({
-      inputCurrency: input.inputCurrency,
-      inputPaymentMethod: "INTERNAL",
-      outputCurrency: "BRL",
-      outputPaymentMethod: "PIX",
-      inputAmount: input.inputAmount,
-      inputThirdParty: "false",
-      outputThirdParty: "false",
-      blockchainSendMethod: "PERMIT",
+    const { ticket, quote } = await this.quoteAndTicket({
       subAccountId: input.subAccountId,
-    });
-    const quoteUri = `/v2/account/quote/fixed-rate?${q}`;
-    const quoteRes = await fetch(`${this.config.baseUrl}${quoteUri}`, { headers: this.signedHeaders("GET", quoteUri) });
-    if (!quoteRes.ok) throw new Error(`avenia payout quote ${quoteRes.status}: ${(await quoteRes.text()).slice(0, 200)}`);
-    const quote = (await quoteRes.json()) as AveniaSwapResult["quote"] & { quoteToken?: string };
-    if (!quote.quoteToken) throw new Error("avenia payout quote: no quoteToken");
-
-    const ticketUri = `/v2/account/tickets/?subAccountId=${encodeURIComponent(input.subAccountId)}`;
-    const body = JSON.stringify({
-      quoteToken: quote.quoteToken,
-      ticketBrlPixOutput: { beneficiaryBrlBankAccountId: input.beneficiaryBrlBankAccountId },
-      ...(input.externalId ? { externalId: input.externalId } : {}),
-    });
-    const ticketRes = await fetch(`${this.config.baseUrl}${ticketUri}`, {
-      method: "POST",
-      headers: this.signedHeaders("POST", ticketUri, body),
-      body,
-    });
-    if (!ticketRes.ok) throw new Error(`avenia payout ticket ${ticketRes.status}: ${(await ticketRes.text()).slice(0, 200)}`);
-    const ticket = (await ticketRes.json()) as { id?: string };
-    if (!ticket.id) throw new Error("avenia payout ticket: no id");
-    return {
-      ticketId: ticket.id,
+      label: "payout",
       quote: {
-        inputCurrency: quote.inputCurrency,
-        inputAmount: quote.inputAmount,
-        outputCurrency: quote.outputCurrency,
-        outputAmount: quote.outputAmount,
-        basePrice: quote.basePrice,
-        pairName: quote.pairName,
-        appliedFees: quote.appliedFees ?? [],
+        inputCurrency: input.inputCurrency,
+        inputPaymentMethod: "INTERNAL",
+        outputCurrency: "BRL",
+        outputPaymentMethod: "PIX",
+        inputAmount: input.inputAmount,
       },
-    };
+      ticketOutput: { ticketBrlPixOutput: { beneficiaryBrlBankAccountId: input.beneficiaryBrlBankAccountId } },
+      externalId: input.externalId,
+    });
+    return { ticketId: ticket.id, quote };
   }
-
 }
 
 // Composition point: the env-configured client, or null when keys are absent
