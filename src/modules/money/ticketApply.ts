@@ -120,5 +120,33 @@ export async function applyTicketStatus(
       if (!(e instanceof DuplicateLedgerPostError)) throw e; // idempotent replay — never double-post
     }
   }
+
+  // Payout settle (PRD-11): held source currency leaves custody entirely — the BRL lands at the
+  // beneficiary's bank, outside our ledger. Two postings in the SOURCE currency for the full
+  // reserved amount (the PIX-out fee is Avenia's, baked into the smaller BRL output and itemized
+  // in the quote snapshot; dest_amount records the BRL actually sent, display-only).
+  if (nextState === "settled" && tx.type === "payout" && tx.source_amount && tx.source_currency) {
+    const currency = tx.source_currency as Currency;
+    const amount = BigInt(tx.source_amount);
+    const custody = await ensureAccount(client, {
+      key: `avenia:custody:${currency}`, type: "vendor_asset", currency,
+    });
+    const orgAccount = await ensureAccount(client, {
+      key: `org:${tx.org_id}:${currency}`, type: "customer_liability", orgId: tx.org_id, currency,
+    });
+    try {
+      await postBalancedTransactionOn(client, {
+        description: `payout settled (reserved source amount)`,
+        orgTransactionId: tx.id,
+        idempotencyKey: `payout-settle:${tx.id}`,
+        postings: [
+          { accountId: custody, amount: -amount, currency },
+          { accountId: orgAccount, amount: amount, currency },
+        ],
+      });
+    } catch (e) {
+      if (!(e instanceof DuplicateLedgerPostError)) throw e; // idempotent replay — never double-post
+    }
+  }
   return "apply";
 }

@@ -100,6 +100,50 @@ export async function balancesForOrg(orgId: string): Promise<Record<string, numb
   return Object.fromEntries(rows.map((r) => [r.currency, Number(r.bal)]));
 }
 
+/** Daily settled-balance history for an org: cumulative per-currency liability balance at the
+ *  end of each São Paulo day, one row per day from the first posting through today (gaps carry
+ *  the previous balance forward). Same Number() bounds note as balancesForOrg.
+ *  NOTE: pre-0015 backfilled postings carry the migration's created_at, not the original deposit
+ *  date — early history for those orgs starts at the backfill day. */
+export interface BalanceHistoryDay {
+  date: string; // YYYY-MM-DD (America/Sao_Paulo)
+  balances: Record<string, number>; // minor units per currency, cumulative
+}
+
+export async function balanceHistoryForOrg(orgId: string): Promise<BalanceHistoryDay[]> {
+  const { rows } = await pool.query<{ day: string; currency: string; delta: string }>(
+    `select to_char((p.created_at at time zone 'America/Sao_Paulo')::date, 'YYYY-MM-DD') as day,
+            p.currency, (-sum(p.amount))::text as delta
+       from ledger_postings p
+       join ledger_accounts a on a.id = p.account_id
+      where a.org_id = $1 and a.type = 'customer_liability'
+      group by 1, 2
+      order by 1`,
+    [orgId],
+  );
+  if (!rows.length) return [];
+
+  const deltasByDay = new Map<string, Array<{ currency: string; delta: number }>>();
+  for (const r of rows) {
+    const list = deltasByDay.get(r.day) ?? [];
+    list.push({ currency: r.currency, delta: Number(r.delta) });
+    deltasByDay.set(r.day, list);
+  }
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" });
+  const running: Record<string, number> = {};
+  const out: BalanceHistoryDay[] = [];
+  // Walk day by day from the first posting to today, carrying balances across quiet days.
+  for (let d = new Date(`${rows[0]!.day}T00:00:00Z`); ; d.setUTCDate(d.getUTCDate() + 1)) {
+    const day = d.toISOString().slice(0, 10);
+    for (const { currency, delta } of deltasByDay.get(day) ?? []) {
+      running[currency] = (running[currency] ?? 0) + delta;
+    }
+    out.push({ date: day, balances: { ...running } });
+    if (day >= today) break;
+  }
+  return out;
+}
+
 /** Balance of an account = SUM of its postings (per currency). */
 export async function balanceOf(accountId: string, currency: Currency): Promise<bigint> {
   const { rows } = await pool.query<{ bal: string | null }>(

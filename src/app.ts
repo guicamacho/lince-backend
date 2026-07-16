@@ -47,7 +47,8 @@ import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/o
 import { ensureAveniaSubaccount, depositDetailsForOrg } from "./modules/onboarding/aveniaProvisioning.js";
 import { createDeposit, listTransactionsForOrg, reconcileInFlightDeposits, mapVendorFees } from "./modules/money/deposits.js";
 import { createConvert } from "./modules/money/convert.js";
-import { balancesForOrg } from "./modules/ledger/ledger.service.js";
+import { createPayout } from "./modules/money/payout.js";
+import { balancesForOrg, balanceHistoryForOrg } from "./modules/ledger/ledger.service.js";
 import { getRates, type RateQuoteFn } from "./modules/money/rates.service.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { requireStepUp } from "./modules/access/requireStepUp.js";
@@ -358,6 +359,30 @@ app.post(
   },
 );
 
+// PIX payout (PRD-11): money-out of the customer's held BRLA to a registered payee over PIX.
+// Same money-movement gates as Convert plus the payout-only ones inside createPayout
+// (beneficiary org/rail/status checks, 24h post-recovery hold). Two-phase reservation under
+// the org money lock lives in createPayout.
+app.post(
+  "/app/payouts",
+  rateLimit("ticket"),
+  requirePermission("initiate_payout"),
+  requireStepUp(env.stepUp.enforced),
+  requireMfaEnrolled(),
+  async (req: Request, res: Response) => {
+    const { beneficiaryId, amount, idemKey } = (req.body ?? {}) as {
+      beneficiaryId?: string; amount?: string; idemKey?: string;
+    };
+    if (!beneficiaryId || !amount || !idemKey) {
+      res.status(422).json({ error: "beneficiaryId_amount_idemKey_required" });
+      return;
+    }
+    res.status(201).json(
+      await createPayout(res.locals.orgId, res.locals.personId ?? null, { beneficiaryId, amount, idemKey }, aveniaFromEnv()),
+    );
+  },
+);
+
 // Transaction list — the frozen contract the F3 Transações UI was built against.
 app.get("/app/transactions", rateLimit("reads"), async (_req: Request, res: Response) => {
   res.json({ transactions: await listTransactionsForOrg(res.locals.orgId) });
@@ -366,6 +391,11 @@ app.get("/app/transactions", rateLimit("reads"), async (_req: Request, res: Resp
 // Ledger balances (minor units per currency) — settled money only, straight from postings.
 app.get("/app/balances", rateLimit("reads"), async (_req: Request, res: Response) => {
   res.json({ balances: await balancesForOrg(res.locals.orgId) });
+});
+
+// Daily settled-balance history (Início chart) — cumulative per-currency, SP days, gaps filled.
+app.get("/app/balance-history", rateLimit("reads"), async (_req: Request, res: Response) => {
+  res.json({ history: await balanceHistoryForOrg(res.locals.orgId) });
 });
 
 // Display FX rates for the Câmbio board (BRL-USD both ways via BRLA<>USDT; BRL-EUR one way),

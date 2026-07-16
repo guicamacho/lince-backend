@@ -1,0 +1,53 @@
+# Backend CI/CD. Every push/PR runs the full suite (typecheck + 256 integration tests against a
+# real Postgres — the PRD-07 money-path races included). A push to dev that passes then deploys
+# to Fly lince-api-dev (release_command in fly.toml runs migrations).
+#
+# Required repo secret for the deploy job: FLY_API_TOKEN (fly tokens create deploy -a lince-api-dev).
+# Staging/prod deploy stanzas land when the lince-api-staging / lince-api-prod Fly apps exist
+# (Environments & Promotion Strategy, Confluence 262373377).
+name: CI
+
+on:
+  push:
+    branches: [dev, staging, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: lince_test # resetDb hard-guards on this exact name — do not rename
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/lince_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  deploy-dev:
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency: deploy-dev # serialize deploys; a release_command migration must never race itself
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

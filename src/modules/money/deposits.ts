@@ -246,9 +246,11 @@ export async function reconcileInFlightDeposits(rail: TicketReader, quietSeconds
 /** The frozen GET /app/transactions contract the F3 customer UI was built against. */
 export async function listTransactionsForOrg(orgId: string): Promise<unknown[]> {
   const { rows } = await pool.query(
-    `select id, type, state, source_currency, source_amount, dest_currency, dest_amount,
-            quote, vendor_ref, created_at
-       from org_transactions where org_id = $1 order by created_at desc limit 100`,
+    `select t.id, t.type, t.state, t.source_currency, t.source_amount, t.dest_currency, t.dest_amount,
+            t.quote, t.vendor_ref, t.created_at, b.label as beneficiary_label
+       from org_transactions t
+       left join avenia_beneficiaries b on b.id = t.beneficiary_id
+      where t.org_id = $1 order by t.created_at desc limit 100`,
     [orgId],
   );
   return rows.map((r) => {
@@ -269,7 +271,7 @@ export async function listTransactionsForOrg(orgId: string): Promise<unknown[]> 
       destAmount: r.dest_amount === null ? 0 : Number(r.dest_amount),
       fees: mapVendorFees(quote.appliedFees),
       rebate: null,
-      beneficiaryLabel: null,
+      beneficiaryLabel: r.beneficiary_label ?? null,
       createdAt: r.created_at,
       vendorRef: r.vendor_ref,
       quote: { basePrice: quote.basePrice, pairName: quote.pairName },
