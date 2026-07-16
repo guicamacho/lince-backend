@@ -1,15 +1,10 @@
 /**
- * Avenia client — the HARNESS is real, the money calls are STUBBED.
+ * Avenia client — live money rails: PIX deposit, internal swap (Convert), PIX payout.
  *
  * Service auth = API key + RSA request signing (PKCS#1 v1.5, SHA-256) over
  * timestamp + method + the FULL path+query + body, via the shared signing helper.
- * Every call carries ?subAccountId=.
- *
- * Money flows (quote -> ticket, deposit/swap/payout) are gated on the Avenia
- * Wallets/Operations API mapping (BUILD_BRIEF §6) and throw until then.
+ * Every call carries ?subAccountId= except createSubAccount (master-scoped).
  */
-import type { Currency } from "../../../money/money.js";
-import type { Quote, Ticket, RailProvider } from "../provider.types.js";
 import type { AveniaConfig } from "./avenia.types.js";
 import { aveniaSignedHeaders } from "./signing.js";
 import { env } from "../../../config/env.js";
@@ -103,7 +98,7 @@ export interface TicketReader {
   findTicketByExternalId(input: { subAccountId: string; externalId: string }): Promise<TicketView | null>;
 }
 
-export class AveniaClient implements RailProvider, SubAccountCreator, AccountInfoReader, DepositRail, SwapRail, PayoutRail, TicketReader {
+export class AveniaClient implements SubAccountCreator, AccountInfoReader, DepositRail, SwapRail, PayoutRail, TicketReader {
   constructor(private readonly config: AveniaConfig) {}
 
   /** One ticket's current status — the reconciler's poll (subAccountId must match the
@@ -215,16 +210,6 @@ export class AveniaClient implements RailProvider, SubAccountCreator, AccountInf
       body,
       privateKeyPem: this.config.signingPrivateKeyPem,
     });
-  }
-
-  async getFixedRateQuote(_input: {
-    subAccountId: string;
-    sourceCurrency: Currency;
-    destCurrency: Currency;
-    sourceAmount: bigint;
-  }): Promise<Quote> {
-    // GET /v2/account/quote/fixed-rate?subAccountId=…  (quoteToken ~15s, appliedFees[] each rebatable)
-    throw new Error("STUB: Avenia quote gated on Wallets/Operations API mapping (BUILD_BRIEF §6)");
   }
 
   /**
@@ -401,15 +386,6 @@ export class AveniaClient implements RailProvider, SubAccountCreator, AccountInf
     };
   }
 
-  async createTicket(_input: { subAccountId: string; quoteToken: string }): Promise<Ticket> {
-    // POST /v2/account/tickets?subAccountId=…  (lifecycle UNPAID->PROCESSING->PAID->FAILED)
-    throw new Error("STUB: Avenia ticket gated on Wallets/Operations API mapping (BUILD_BRIEF §6)");
-  }
-
-  async listTickets(_input: { subAccountId: string }): Promise<Ticket[]> {
-    // GET /v2/account/tickets?subAccountId=…  (webhook delivery-gap poll — B3/gapPoll)
-    throw new Error("STUB: Avenia listTickets gated on Wallets/Operations API mapping (BUILD_BRIEF §6)");
-  }
 }
 
 // Composition point: the env-configured client, or null when keys are absent

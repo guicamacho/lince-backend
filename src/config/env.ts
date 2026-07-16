@@ -20,7 +20,7 @@ export const env = {
   databaseUrl: required("DATABASE_URL"),
   clerk: {
     secretKey: optional("CLERK_SECRET_KEY"),
-    publishableKey: optional("CLERK_PUBLISHABLE_KEY"),
+    // CLERK_PUBLISHABLE_KEY is read by the Clerk SDK straight from process.env — no field here.
     webhookSigningSecret: optional("CLERK_WEBHOOK_SIGNING_SECRET"),
   },
   // Public origin of the customer app (lince-customer). Used to point Clerk team-invitation
@@ -33,7 +33,6 @@ export const env = {
     signingPrivateKeyPem: resolvePem(optional("AVENIA_SIGNING_PRIVATE_KEY"), optional("AVENIA_SIGNING_KEY_FILE")),
   },
   didit: {
-    apiKey: optional("DIDIT_API_KEY"),
     webhookSecret: optional("DIDIT_WEBHOOK_SECRET"),
     // Document submission uses the real Didit doc API only when exactly "true"; else mocked
     // (stores a reference, never bytes, either way). Flip when the Didit integration lands.
@@ -53,11 +52,10 @@ export const env = {
     slackWebhookUrl: optional("NOTIFY_SLACK_WEBHOOK_URL"),
   },
   // MFA policy (B15). Ruling (PRD-07 v5): optional by default (config-only flip to
-  // mandatory), SMS disabled, 24h post-recovery money-out hold.
+  // mandatory), no SMS, 24h post-recovery money-out hold (hours passed to recoveryHold.ts
+  // by its caller when the recovery trigger lands — no env field until then).
   mfa: {
     policy: (process.env.MFA_POLICY === "mandatory" ? "mandatory" : "optional") as "optional" | "mandatory",
-    smsEnabled: process.env.MFA_SMS_ENABLED === "true",
-    recoveryHoldHours: Number(optional("RECOVERY_HOLD_HOURS") ?? 24),
   },
   // API rate limiting (B13). Off unless exactly "true" (dev/tests aren't throttled).
   // webhookMaxBytes caps the JSON body express parses (webhook intake needs > 100kb).
