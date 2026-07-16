@@ -3,7 +3,8 @@ import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { pool } from "../src/db/pool.js";
-import { createDeposit, reconcileInFlightDeposits, type DepositClient } from "../src/modules/money/deposits.js";
+import { createDeposit, type DepositClient } from "../src/modules/money/deposits.js";
+import { reconcileInFlightTickets } from "../src/modules/money/moneyLoop.js";
 import { drainWebhooks } from "../src/modules/webhooks/processor.js";
 import { resetDb, createOrg } from "./helpers.js";
 
@@ -154,13 +155,13 @@ test("reconciler settles a quiet in-flight deposit when webhooks never arrive", 
   // age the row past the quiet window (webhooks would normally win inside it)
   await pool.query("update org_transactions set updated_at = now() - interval '10 minutes' where id = $1", [receipt.id]);
   const rail = { async getTicket() { return { id: "tkt_1", status: "PAID" }; }, async findTicketByExternalId() { return null; } };
-  const applied = await reconcileInFlightDeposits(rail, 45, 10);
+  const applied = await reconcileInFlightTickets(rail, 45, 10);
   assert.equal(applied, 1);
   const { rows } = await pool.query("select state, quote->>'ticketStatus' as ts from org_transactions where id = $1", [receipt.id]);
   assert.equal(rows[0].state, "settled");
   assert.equal(rows[0].ts, "PAID");
   // second pass: nothing left in flight
-  assert.equal(await reconcileInFlightDeposits(rail, 45, 10), 0);
+  assert.equal(await reconcileInFlightTickets(rail, 45, 10), 0);
 });
 
 test("invalid amountBrl -> 422 before any ticket/DB work", async () => {
@@ -215,7 +216,7 @@ test("reconciler recovers a crash-orphan ('created', null vendor_ref) via extern
       return { id: "tkt_recovered", status: "PAID", outputAmount: "99.80" };
     },
   };
-  const applied = await reconcileInFlightDeposits(rail, 45, 10);
+  const applied = await reconcileInFlightTickets(rail, 45, 10);
   assert.equal(applied, 1);
   const { rows } = await pool.query("select state, vendor_ref, dest_amount from org_transactions where id = $1", [ins.rows[0]!.id]);
   assert.equal(rows[0].vendor_ref, "tkt_recovered");
@@ -224,7 +225,7 @@ test("reconciler recovers a crash-orphan ('created', null vendor_ref) via extern
 });
 
 test("mapVendorFees: raw vendor jsonb of any shape degrades, never throws", async () => {
-  const { mapVendorFees } = await import("../src/modules/money/deposits.js");
+  const { mapVendorFees } = await import("../src/modules/money/moneyLoop.js");
   // well-formed
   const ok = mapVendorFees([{ type: "Gas fee", amount: "1.50", currency: "BRL", rebatable: true }]);
   const first = ok[0]!;

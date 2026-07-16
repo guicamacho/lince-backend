@@ -25,7 +25,7 @@ import { HttpError } from "../../http/error.js";
 import { parseCustomerAmount, vendorMinor, type Currency } from "../../money/money.js";
 import { acquireOrgMoneyLock } from "../../db/lockKeys.js";
 import { ensureAveniaSubaccount } from "../onboarding/aveniaProvisioning.js";
-import { mapVendorFees, type MappedFee } from "./deposits.js";
+import { mapVendorFees, type MappedFee } from "./moneyLoop.js";
 import type { SwapRail, SubAccountCreator, AccountInfoReader } from "../providers/avenia/avenia.client.js";
 
 export type ConvertClient = SwapRail & SubAccountCreator & AccountInfoReader;
@@ -152,7 +152,7 @@ export async function createConvert(
     // 'failed' would strand a swap Avenia actually executed (the reconciler skips 'failed' and the
     // PAID webhook can't match a null vendor_ref) — customer money loss. Leave the row 'created' so
     // the reconciler settles the real ticket by externalId if it exists, or releases the reservation
-    // when no ticket was ever created (deposits.ts:reconcileInFlightDeposits). Record the error only.
+    // when no ticket was ever created (moneyLoop.ts:reconcileInFlightTickets). Record the error only.
     await pool.query(
       `update org_transactions set error = $2, updated_at = now() where id = $1 and state = 'created'`,
       [txId, JSON.stringify({ stage: "create", message: e instanceof Error ? e.message : String(e) })],

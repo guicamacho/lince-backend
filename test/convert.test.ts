@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { pool, withTransaction } from "../src/db/pool.js";
 import { createConvert, type ConvertClient } from "../src/modules/money/convert.js";
-import { reconcileInFlightDeposits } from "../src/modules/money/deposits.js";
+import { reconcileInFlightTickets } from "../src/modules/money/moneyLoop.js";
 import { ensureAccount, postBalancedTransactionOn, balancesForOrg } from "../src/modules/ledger/ledger.service.js";
 import { drainWebhooks } from "../src/modules/webhooks/processor.js";
 import { resetDb, createOrg } from "./helpers.js";
@@ -154,7 +154,7 @@ test("Phase-2 lost response leaves the row RECOVERABLE ('created'), and the reco
   assert.equal(row.rows[0]!.state, "created");
 
   await ageRow(orgId);
-  const applied = await reconcileInFlightDeposits(client as never, 30);
+  const applied = await reconcileInFlightTickets(client as never, 30);
   assert.equal(applied, 1, "reconciler recovered and settled the executed swap");
   const bal = await balancesForOrg(orgId);
   assert.equal(bal.BRLA, 5_000);
@@ -170,7 +170,7 @@ test("Phase-2 failure with NO ticket at Avenia is released by the reconciler (re
     /convert_pending_reconcile/,
   );
   await ageRow(orgId);
-  await reconcileInFlightDeposits(client as never, 30);
+  await reconcileInFlightTickets(client as never, 30);
   const row = await pool.query<{ state: string }>("select state from org_transactions where org_id = $1", [orgId]);
   assert.equal(row.rows[0]!.state, "failed", "no ticket existed -> reservation released");
   // Balance never moved, and the full amount is convertible again.

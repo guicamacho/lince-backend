@@ -45,7 +45,8 @@ import { bootstrapOrgForClerkUser } from "./modules/onboarding/bootstrap.js";
 import { lookupCnpj } from "./modules/onboarding/cnpjLookup.js";
 import { currentOrgForClerkUser, advanceCallerOrg } from "./modules/onboarding/onboardingState.js";
 import { ensureAveniaSubaccount, depositDetailsForOrg } from "./modules/onboarding/aveniaProvisioning.js";
-import { createDeposit, listTransactionsForOrg, reconcileInFlightDeposits, mapVendorFees } from "./modules/money/deposits.js";
+import { createDeposit } from "./modules/money/deposits.js";
+import { listTransactionsForOrg, reconcileInFlightTickets, mapVendorFees } from "./modules/money/moneyLoop.js";
 import { createConvert } from "./modules/money/convert.js";
 import { createPayout } from "./modules/money/payout.js";
 import { balancesForOrg, balanceHistoryForOrg } from "./modules/ledger/ledger.service.js";
@@ -891,7 +892,7 @@ if (process.env.NODE_ENV !== "test") {
         // webhooks win when flowing; this catches missed deliveries — and is the ONLY
         // settle path in local dev, where webhooks point at the deployed endpoint.
         const avenia = aveniaFromEnv();
-        if (avenia && tick % 12 === 0) await reconcileInFlightDeposits(avenia);
+        if (avenia && tick % 12 === 0) await reconcileInFlightTickets(avenia);
       } catch (err) {
         console.warn("drain.tick_failed", err instanceof Error ? err.message : String(err));
       } finally {

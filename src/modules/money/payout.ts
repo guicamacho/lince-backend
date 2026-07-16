@@ -23,7 +23,7 @@ import { acquireOrgMoneyLock } from "../../db/lockKeys.js";
 import { moneyOutHoldActive } from "../access/recoveryHold.js";
 import { ensureAveniaSubaccount } from "../onboarding/aveniaProvisioning.js";
 import { getPayoutBeneficiary, ensureAveniaBeneficiary } from "../beneficiaries/beneficiaries.service.js";
-import { mapVendorFees, type MappedFee } from "./deposits.js";
+import { mapVendorFees, type MappedFee } from "./moneyLoop.js";
 import type { PayoutRail, SubAccountCreator } from "../providers/avenia/avenia.client.js";
 
 export type PayoutClient = PayoutRail & SubAccountCreator;
