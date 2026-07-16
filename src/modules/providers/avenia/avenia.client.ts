@@ -69,18 +69,55 @@ export interface SwapRail {
   }): Promise<AveniaSwapResult>;
 }
 
-/** PIX payout (PRD-11): BRLA held balance -> BRL PIX to a registered Avenia beneficiary.
- *  Same quote->ticket primitive; output rides ticketBrlPixOutput instead of INTERNAL.
- *  Body shape from integration-guide.avenia.io (Operations/quotesAndTickets, 2026-07-14);
- *  the quote leg (BRLA INTERNAL -> BRL PIX, PERMIT) verified live on the sandbox. */
+/** Payout rails (PRD-11): held balance -> an external destination. Body shapes from
+ *  integration-guide.avenia.io (Operations/quotesAndTickets + Beneficiaries-Bank-Accounts,
+ *  verified 2026-07-15): BRL out via PIX (from BRLA), USD out via ACH/WIRE (from USDT/USDC),
+ *  stablecoins out to external wallets (wallet inline in the ticket, no registration).
+ *  EUR/SEPA (from EURC only) is deferred until customers can hold EURC. */
+export interface UsdBeneficiaryBody {
+  alias: string;
+  bankAccountNumber: string;
+  bankRoutingNumber: string; // ABA routing number
+  bankBeneficiaryName: string;
+  bankName: string;
+  beneficiaryAddress: {
+    streetLine1: string;
+    streetLine2?: string;
+    city: string;
+    state: string;
+    postalCode: string;
+    country: string; // e.g. "USA"
+  };
+}
 export interface PayoutRail {
   /** Register a BRL beneficiary bank account (PIX key) under a subaccount; returns Avenia's id. */
   createBrlBeneficiary(input: { subAccountId: string; alias: string; pixKey: string }): Promise<{ id: string }>;
+  /** Register a USD beneficiary bank account (routing + account + address); returns Avenia's id. */
+  createUsdBeneficiary(input: { subAccountId: string } & UsdBeneficiaryBody): Promise<{ id: string }>;
   createPixPayout(input: {
     subAccountId: string;
     inputCurrency: string; // held balance being paid out (BRLA today)
     inputAmount: string;
     beneficiaryBrlBankAccountId: string; // Avenia-side beneficiary id (createBrlBeneficiary)
+    externalId?: string;
+  }): Promise<AveniaSwapResult>;
+  /** USD payout over ACH or WIRE, funded from a held stablecoin (USDT/USDC). */
+  createUsdPayout(input: {
+    subAccountId: string;
+    inputCurrency: string; // USDT | USDC
+    inputAmount: string;
+    method: "ACH" | "WIRE";
+    beneficiaryUsdBankAccountId: string; // Avenia-side beneficiary id (createUsdBeneficiary)
+    externalId?: string;
+  }): Promise<AveniaSwapResult>;
+  /** Stablecoin send to an external wallet — the address rides inline, no registration. */
+  createCryptoPayout(input: {
+    subAccountId: string;
+    currency: string; // USDT | USDC (input == output)
+    inputAmount: string;
+    chain: string; // Avenia chain enum: TRON | POLYGON | ETHEREUM | BASE | ...
+    walletAddress: string;
+    walletMemo?: string;
     externalId?: string;
   }): Promise<AveniaSwapResult>;
 }
@@ -355,6 +392,80 @@ export class AveniaClient implements SubAccountCreator, AccountInfoReader, Depos
         inputAmount: input.inputAmount,
       },
       ticketOutput: { ticketBrlPixOutput: { beneficiaryBrlBankAccountId: input.beneficiaryBrlBankAccountId } },
+      externalId: input.externalId,
+    });
+    return { ticketId: ticket.id, quote };
+  }
+
+  /** Register a USD beneficiary bank account. Same TRAILING-SLASH collection path rule as /brl/. */
+  async createUsdBeneficiary(input: { subAccountId: string } & UsdBeneficiaryBody): Promise<{ id: string }> {
+    const { subAccountId, ...bankBody } = input;
+    const uri = `/v2/account/beneficiaries/bank-accounts/usd/?subAccountId=${encodeURIComponent(subAccountId)}`;
+    const body = JSON.stringify(bankBody);
+    const res = await fetch(`${this.config.baseUrl}${uri}`, {
+      method: "POST",
+      headers: this.signedHeaders("POST", uri, body),
+      body,
+    });
+    if (!res.ok) throw new Error(`avenia usd beneficiary create ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const out = (await res.json()) as { id?: string };
+    if (!out.id) throw new Error("avenia usd beneficiary create: no id");
+    return { id: out.id };
+  }
+
+  async createUsdPayout(input: {
+    subAccountId: string;
+    inputCurrency: string;
+    inputAmount: string;
+    method: "ACH" | "WIRE";
+    beneficiaryUsdBankAccountId: string;
+    externalId?: string;
+  }): Promise<AveniaSwapResult> {
+    const { ticket, quote } = await this.quoteAndTicket({
+      subAccountId: input.subAccountId,
+      label: "payout",
+      quote: {
+        inputCurrency: input.inputCurrency,
+        inputPaymentMethod: "INTERNAL",
+        outputCurrency: "USD",
+        outputPaymentMethod: input.method,
+        inputAmount: input.inputAmount,
+      },
+      // WIRE and ACH carry different output keys (integration guide, quotesAndTickets).
+      ticketOutput: input.method === "WIRE"
+        ? { ticketUsdWireOutput: { beneficiaryUsdBankAccountId: input.beneficiaryUsdBankAccountId } }
+        : { ticketUsdOutput: { beneficiaryUsdBankAccountId: input.beneficiaryUsdBankAccountId } },
+      externalId: input.externalId,
+    });
+    return { ticketId: ticket.id, quote };
+  }
+
+  async createCryptoPayout(input: {
+    subAccountId: string;
+    currency: string;
+    inputAmount: string;
+    chain: string;
+    walletAddress: string;
+    walletMemo?: string;
+    externalId?: string;
+  }): Promise<AveniaSwapResult> {
+    const { ticket, quote } = await this.quoteAndTicket({
+      subAccountId: input.subAccountId,
+      label: "payout",
+      quote: {
+        inputCurrency: input.currency,
+        inputPaymentMethod: "INTERNAL",
+        outputCurrency: input.currency,
+        outputPaymentMethod: input.chain,
+        inputAmount: input.inputAmount,
+      },
+      ticketOutput: {
+        ticketBlockchainOutput: {
+          walletChain: input.chain,
+          walletAddress: input.walletAddress,
+          ...(input.walletMemo ? { walletMemo: input.walletMemo } : {}),
+        },
+      },
       externalId: input.externalId,
     });
     return { ticketId: ticket.id, quote };

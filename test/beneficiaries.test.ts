@@ -13,13 +13,17 @@ after(() => pool.end());
 
 const clerkId = () => `user_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 
-// A valid ACH payee (simplest fiat rail) reused by the service tests.
+// A valid ACH payee reused by the service tests. Bank name + US address are REQUIRED since
+// 2026-07-15: Avenia's /usd/ beneficiary registration needs them, so capture demands them.
 const achBody = () => ({
   label: "US Supplier",
   rail: "ach",
   payeeLegalName: "Acme Inc",
   purposeOfPayment: "supplier invoice",
-  destination: { routingNumber: "021000021", accountNumber: "12345678" },
+  destination: {
+    routingNumber: "021000021", accountNumber: "12345678", bankName: "Chase",
+    streetLine1: "1 Main St", city: "New York", state: "NY", postalCode: "10001",
+  },
 });
 
 const rejects = (body: Record<string, unknown>, code: RegExp | string) =>
@@ -44,7 +48,8 @@ test("validateBeneficiary — ACH/Fedwire: USD/US, 9-digit routing", () => {
   assert.equal(v.asset, "USD");
   assert.equal(v.payeeCountry, "US");
   assert.equal(v.destHint, "5678");
-  rejects({ ...achBody(), destination: { routingNumber: "12", accountNumber: "1" } }, "invalid_routing_number");
+  rejects({ ...achBody(), destination: { ...achBody().destination, routingNumber: "12" } }, "invalid_routing_number");
+  rejects({ ...achBody(), destination: { routingNumber: "021000021", accountNumber: "1" } }, "missing_bankName");
 });
 
 test("validateBeneficiary — SEPA: EUR, IBAN+BIC shape, country from IBAN", () => {

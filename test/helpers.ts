@@ -1,5 +1,9 @@
 /** Test helpers — run against lince_test (DATABASE_URL set by the `test` script). */
-import { pool } from "../src/db/pool.js";
+import { randomUUID } from "node:crypto";
+import { pool, withTransaction } from "../src/db/pool.js";
+import { ensureAccount, postBalancedTransactionOn } from "../src/modules/ledger/ledger.service.js";
+import { drainWebhooks } from "../src/modules/webhooks/processor.js";
+import type { Currency } from "../src/money/money.js";
 
 // Data tables to clear between tests. Seed tables (jurisdiction_policies, providers,
 // provider_currencies) are intentionally NOT truncated.
@@ -51,6 +55,31 @@ export async function insertCase(
     [type, orgId, openedBy],
   );
   return rows[0]!.id;
+}
+
+/** A SETTLED balance for an org (mirrors a deposit settle: custody +minor / org liability -minor). */
+export async function seedBalance(orgId: string, currency: Currency, minor: bigint): Promise<void> {
+  await withTransaction(async (c) => {
+    const custody = await ensureAccount(c, { key: `avenia:custody:${currency}`, type: "vendor_asset", currency });
+    const org = await ensureAccount(c, { key: `org:${orgId}:${currency}`, type: "customer_liability", orgId, currency });
+    await postBalancedTransactionOn(c, {
+      description: "seed",
+      postings: [
+        { accountId: custody, amount: minor, currency },
+        { accountId: org, amount: -minor, currency },
+      ],
+    });
+  });
+}
+
+/** Drive a PAID settle through the webhook processor for the given vendor ticket id. */
+export async function settleTicket(vendorRef: string): Promise<void> {
+  await pool.query(
+    `insert into webhook_events (provider_code, external_event_id, event_type, payload)
+     values ('avenia', $1, 'TICKET-PAID', $2)`,
+    [randomUUID(), JSON.stringify({ event: { id: randomUUID(), data: { type: "TICKET-PAID", ticket: { id: vendorRef, status: "PAID" } } } })],
+  );
+  await drainWebhooks();
 }
 
 export async function createLedgerAccount(

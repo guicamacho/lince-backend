@@ -90,7 +90,19 @@ export function validateBeneficiary(body: Record<string, unknown>): ValidatedBen
       const routingNumber = req(d.routingNumber, "routingNumber", 9);
       if (!/^\d{9}$/.test(routingNumber)) throw new HttpError("invalid_routing_number", 422);
       const accountNumber = req(d.accountNumber, "accountNumber", 34);
-      destination = { routingNumber, accountNumber };
+      // Avenia's USD beneficiary registration additionally needs the bank's name and the
+      // beneficiary's US address (bank-accounts/usd/, verified 2026-07-15). Captured here so
+      // the payee is payable; pre-existing USD payees without them 422 at payout time.
+      const bankName = req(d.bankName, "bankName", 200);
+      const streetLine1 = req(d.streetLine1, "streetLine1", 200);
+      const streetLine2 = str(d.streetLine2) || null;
+      const city = req(d.city, "city", 100);
+      const state = req(d.state, "state", 50);
+      const postalCode = req(d.postalCode, "postalCode", 20);
+      destination = {
+        routingNumber, accountNumber, bankName, streetLine1, city, state, postalCode,
+        ...(streetLine2 ? { streetLine2 } : {}),
+      };
       primaryId = accountNumber;
       break;
     }

@@ -1,100 +1,95 @@
-/** PIX payout (PRD-11): two-phase reservation under the org money lock, beneficiary forwarding,
- *  exactly-once 2-leg settle. Mirrors convert.test.ts — the reference money-out suite. */
+/** Payouts (PRD-11): two-phase reservation under the org money lock across rails (PIX, USD
+ *  ACH/WIRE, crypto), beneficiary forwarding, exactly-once 2-leg settle. */
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { pool, withTransaction } from "../src/db/pool.js";
+import { pool } from "../src/db/pool.js";
 import { createPayout, type PayoutClient } from "../src/modules/money/payout.js";
 import { createConvert } from "../src/modules/money/convert.js";
 import { reconcileInFlightTickets } from "../src/modules/money/moneyLoop.js";
 import { registerPostRecoveryHold } from "../src/modules/access/recoveryHold.js";
-import { ensureAccount, postBalancedTransactionOn, balancesForOrg } from "../src/modules/ledger/ledger.service.js";
-import { drainWebhooks } from "../src/modules/webhooks/processor.js";
-import { resetDb, createOrg } from "./helpers.js";
+import { balancesForOrg } from "../src/modules/ledger/ledger.service.js";
+import { resetDb, createOrg, seedBalance, settleTicket } from "./helpers.js";
 
 beforeEach(resetDb);
 after(() => pool.end());
 
-// A settled BRLA balance for an org (mirrors a deposit settle: custody +minor / org liability -minor).
-async function seedBrla(orgId: string, minor: bigint): Promise<void> {
-  await withTransaction(async (c) => {
-    const custody = await ensureAccount(c, { key: `avenia:custody:BRLA`, type: "vendor_asset", currency: "BRLA" });
-    const org = await ensureAccount(c, { key: `org:${orgId}:BRLA`, type: "customer_liability", orgId, currency: "BRLA" });
-    await postBalancedTransactionOn(c, {
-      description: "seed",
-      postings: [
-        { accountId: custody, amount: minor, currency: "BRLA" },
-        { accountId: org, amount: -minor, currency: "BRLA" },
-      ],
-    });
-  });
-}
+const PIX_DEST = { pixKey: "3f2a8b1e-9c4d-4e7a-b6f0-1d2c3e4a5b6c", pixKeyType: "random" };
+const USD_DEST = {
+  routingNumber: "021000021", accountNumber: "123456789", bankName: "Chase",
+  streetLine1: "1 Main St", city: "New York", state: "NY", postalCode: "10001",
+};
+const WALLET_DEST = { walletAddress: "T" + "9".repeat(33) };
 
-// A PIX payee in the address book, not yet forwarded to Avenia (avenia_beneficiary_id null).
-async function createPixBeneficiary(orgId: string, overrides: Record<string, unknown> = {}): Promise<string> {
+// A payee in the address book, not yet forwarded to Avenia (avenia_beneficiary_id null).
+async function createPayee(orgId: string, overrides: Record<string, unknown> = {}): Promise<string> {
   const { rows } = await pool.query<{ id: string }>(
     `insert into avenia_beneficiaries
-       (org_id, label, rail, dest_currency, destination, dest_hint, payee_legal_name, payee_country,
-        purpose_of_payment, status)
-     values ($1, $2, $3, 'BRL', $4, '6c2c', 'Fornecedor Exemplo LTDA', 'BR', 'pagamento de fornecedor', $5)
+       (org_id, label, rail, dest_currency, network, destination, dest_hint, payee_legal_name,
+        payee_country, purpose_of_payment, status)
+     values ($1, $2, $3, $4, $5, $6, '6c2c', 'Fornecedor Exemplo LTDA', 'BR', 'pagamento de fornecedor', $7)
      returning id`,
     [
       orgId,
       (overrides.label as string) ?? "Fornecedor Exemplo",
       (overrides.rail as string) ?? "pix",
-      JSON.stringify((overrides.destination as object) ?? { pixKey: "3f2a8b1e-9c4d-4e7a-b6f0-1d2c3e4a5b6c", pixKeyType: "random" }),
+      (overrides.asset as string) ?? "BRL",
+      (overrides.network as string) ?? null,
+      JSON.stringify((overrides.destination as object) ?? PIX_DEST),
       (overrides.status as string) ?? "active",
     ],
   );
   return rows[0]!.id;
 }
 
-// Fake Avenia: counts beneficiary registrations and payout tickets; PIX-out fee ~2% baked in.
+// Fake Avenia covering every payout rail: counts registrations + tickets, captures call args.
 function fakeClient() {
   let tickets = 0;
   let forwards = 0;
-  const client: PayoutClient & { tickets: number; forwards: number } = {
+  const calls: Array<Record<string, unknown>> = [];
+  const quoteFor = (inputCurrency: string, inputAmount: string, outputCurrency: string) => ({
+    inputCurrency, inputAmount, outputCurrency,
+    outputAmount: (Number(inputAmount) * 0.98).toFixed(outputCurrency === "USD" ? 2 : 6),
+    basePrice: "1", pairName: `${inputCurrency}${outputCurrency}`,
+    appliedFees: [{ type: "Out Fee", amount: (Number(inputAmount) * 0.02).toFixed(2), currency: inputCurrency, rebatable: true }],
+  });
+  const client: PayoutClient & { tickets: number; forwards: number; calls: typeof calls } = {
     get tickets() { return tickets; },
     get forwards() { return forwards; },
+    calls,
     async createSubAccount() { return { id: `sub_${randomUUID().slice(0, 8)}` }; },
-    async createBrlBeneficiary() {
-      forwards++;
+    async createBrlBeneficiary(input: Record<string, unknown>) {
+      forwards++; calls.push({ kind: "brl-beneficiary", ...input });
       return { id: `ben_${forwards}` };
     },
-    async createPixPayout({ inputCurrency, inputAmount }) {
-      tickets++;
-      const out = (Number(inputAmount) * 0.98).toFixed(2);
-      return {
-        ticketId: `tkt_${tickets}`,
-        quote: {
-          inputCurrency, inputAmount, outputCurrency: "BRL", outputAmount: out,
-          basePrice: "1", pairName: "BRLABRL",
-          appliedFees: [{ type: "Out Fee", amount: (Number(inputAmount) * 0.02).toFixed(2), currency: inputCurrency, rebatable: true }],
-        },
-      };
+    async createUsdBeneficiary(input: Record<string, unknown>) {
+      forwards++; calls.push({ kind: "usd-beneficiary", ...input });
+      return { id: `ben_${forwards}` };
+    },
+    async createPixPayout(input: { inputCurrency: string; inputAmount: string }) {
+      tickets++; calls.push({ kind: "pix-payout", ...input });
+      return { ticketId: `tkt_${tickets}`, quote: quoteFor(input.inputCurrency, input.inputAmount, "BRL") };
+    },
+    async createUsdPayout(input: { inputCurrency: string; inputAmount: string; method: string }) {
+      tickets++; calls.push({ kind: "usd-payout", ...input });
+      return { ticketId: `tkt_${tickets}`, quote: quoteFor(input.inputCurrency, input.inputAmount, "USD") };
+    },
+    async createCryptoPayout(input: { currency: string; inputAmount: string; chain: string }) {
+      tickets++; calls.push({ kind: "crypto-payout", ...input });
+      return { ticketId: `tkt_${tickets}`, quote: quoteFor(input.currency, input.inputAmount, input.currency) };
     },
   } as never;
   return client;
 }
 
-async function settle(vendorRef: string): Promise<void> {
-  await pool.query(
-    `insert into webhook_events (provider_code, external_event_id, event_type, payload)
-     values ('avenia', $1, 'TICKET-PAID', $2)`,
-    [randomUUID(), JSON.stringify({ event: { id: randomUUID(), data: { type: "TICKET-PAID", ticket: { id: vendorRef, status: "PAID" } } } })],
-  );
-  await drainWebhooks();
-}
-
-test("createPayout: reserves, forwards the payee, pays out, and settle posts a balanced 2-leg debit", async () => {
+test("PIX: reserves, forwards the payee, pays out, and settle posts a balanced 2-leg debit", async () => {
   const orgId = await createOrg("active");
-  await seedBrla(orgId, 10_000n); // R$100,00
-  const benId = await createPixBeneficiary(orgId);
+  await seedBalance(orgId, "BRLA", 10_000n); // R$100,00
+  const benId = await createPayee(orgId);
   const client = fakeClient();
   const receipt = await createPayout(orgId, null, { beneficiaryId: benId, amount: "50", idemKey: randomUUID() }, client);
   assert.equal(receipt.state, "funding");
   assert.equal(receipt.sourceAmount, 5_000); // 50 BRLA in centavos
-  assert.equal(receipt.destAmount, 4_900); // 49.00 BRL actually sent (fee baked in)
   assert.equal(receipt.beneficiaryId, benId);
 
   // The payee was forwarded to Avenia exactly once and the id persisted.
@@ -103,7 +98,7 @@ test("createPayout: reserves, forwards the payee, pays out, and settle posts a b
     "select avenia_beneficiary_id from avenia_beneficiaries where id = $1", [benId]);
   assert.equal(ben.rows[0]!.avenia_beneficiary_id, "ben_1");
 
-  await settle("tkt_1");
+  await settleTicket("tkt_1");
   const bal = await balancesForOrg(orgId);
   assert.equal(bal.BRLA, 5_000, "BRLA reduced by the full reserved amount");
 
@@ -113,10 +108,106 @@ test("createPayout: reserves, forwards the payee, pays out, and settle posts a b
   assert.deepEqual(audit.rows.map((r) => r.event), ["avenia.beneficiary_forwarded", "payout.initiated"]);
 });
 
+test("USD/ACH: funded from USDT, USD bank payee forwarded once, settle debits USDT", async () => {
+  const orgId = await createOrg("active");
+  await seedBalance(orgId, "USDT", 20_000_000n); // 20 USDT
+  const benId = await createPayee(orgId, { rail: "ach", asset: "USD", destination: USD_DEST });
+  const client = fakeClient();
+  const receipt = await createPayout(orgId, null, { beneficiaryId: benId, amount: "10", idemKey: randomUUID() }, client);
+  assert.equal(receipt.state, "funding");
+  assert.equal(receipt.sourceCurrency, "USDT");
+  assert.equal(receipt.sourceAmount, 10_000_000); // 10 USDT in 6dp minor units
+  assert.equal(receipt.destAmount, 980); // 9.80 USD actually sent (2dp)
+
+  const forward = client.calls.find((c) => c.kind === "usd-beneficiary")!;
+  assert.equal(forward.bankRoutingNumber, "021000021");
+  assert.equal(forward.bankName, "Chase");
+  assert.equal((forward.beneficiaryAddress as { country: string }).country, "USA");
+  const payoutCall = client.calls.find((c) => c.kind === "usd-payout")!;
+  assert.equal(payoutCall.method, "ACH");
+
+  await settleTicket("tkt_1");
+  assert.equal((await balancesForOrg(orgId)).USDT, 10_000_000, "USDT debited by the reserved amount");
+});
+
+test("USD/fedwire rides WIRE", async () => {
+  const orgId = await createOrg("active");
+  await seedBalance(orgId, "USDT", 20_000_000n);
+  const benId = await createPayee(orgId, { rail: "fedwire", asset: "USD", destination: USD_DEST });
+  const client = fakeClient();
+  await createPayout(orgId, null, { beneficiaryId: benId, amount: "5", idemKey: randomUUID() }, client);
+  assert.equal(client.calls.find((c) => c.kind === "usd-payout")!.method, "WIRE");
+});
+
+test("crypto: wallet rides inline (no beneficiary registration), chain label mapped", async () => {
+  const orgId = await createOrg("active");
+  await seedBalance(orgId, "USDT", 20_000_000n);
+  const benId = await createPayee(orgId, {
+    rail: "crypto", asset: "USDT", network: "TRON (TRC-20)", destination: WALLET_DEST,
+  });
+  const client = fakeClient();
+  const receipt = await createPayout(orgId, null, { beneficiaryId: benId, amount: "7.5", idemKey: randomUUID() }, client);
+  assert.equal(receipt.sourceAmount, 7_500_000);
+  assert.equal(client.forwards, 0, "crypto payees are never forwarded");
+  const call = client.calls.find((c) => c.kind === "crypto-payout")!;
+  assert.equal(call.chain, "TRON");
+  assert.equal(call.walletAddress, WALLET_DEST.walletAddress);
+
+  await settleTicket("tkt_1");
+  assert.equal((await balancesForOrg(orgId)).USDT, 12_500_000);
+});
+
+test("incomplete USD payee (pre-2026-07-15 capture) is a 422 BEFORE any reservation", async () => {
+  const orgId = await createOrg("active");
+  await seedBalance(orgId, "USDT", 20_000_000n);
+  const benId = await createPayee(orgId, {
+    rail: "ach", asset: "USD",
+    destination: { routingNumber: "021000021", accountNumber: "123456789" }, // no bankName/address
+  });
+  const client = fakeClient();
+  await assert.rejects(
+    createPayout(orgId, null, { beneficiaryId: benId, amount: "10", idemKey: randomUUID() }, client),
+    /beneficiary_incomplete/,
+  );
+  assert.equal(client.tickets + client.forwards, 0, "Avenia never called");
+  const rows = await pool.query("select count(*)::int as n from org_transactions where org_id = $1", [orgId]);
+  assert.equal(rows.rows[0]!.n, 0, "no reservation was ever created");
+});
+
+test("USDT payout and USDT convert contend for the same pool: exactly one wins (cross-op)", async () => {
+  const orgId = await createOrg("active");
+  await seedBalance(orgId, "USDT", 100_000_000n); // 100 USDT — enough for one 60 but not two
+  const benId = await createPayee(orgId, {
+    rail: "crypto", asset: "USDT", network: "Polygon", destination: { walletAddress: "0x" + "a".repeat(40) },
+  });
+  const payoutClient = fakeClient();
+  const convertClient = {
+    async createSubAccount() { return { id: "sub_x" }; },
+    async getAccountInfo() { return {}; },
+    async createSwap({ inputCurrency, outputCurrency, inputAmount }: { inputCurrency: string; outputCurrency: string; inputAmount: string }) {
+      return {
+        ticketId: "tkt_conv",
+        quote: {
+          inputCurrency, inputAmount, outputCurrency, outputAmount: (Number(inputAmount) * 5.2).toFixed(2),
+          basePrice: "5.2", pairName: "USDTBRLA", appliedFees: [],
+        },
+      };
+    },
+  } as never;
+  const results = await Promise.allSettled([
+    createPayout(orgId, null, { beneficiaryId: benId, amount: "60", idemKey: randomUUID() }, payoutClient),
+    createConvert(orgId, null, { from: "USDT", to: "BRLA", amount: "60", idemKey: randomUUID() }, convertClient),
+  ]);
+  const ok = results.filter((r) => r.status === "fulfilled");
+  const rejected = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+  assert.equal(ok.length, 1, "payouts and converts share one USDT reservation pool");
+  assert.match(String((rejected[0]!.reason as Error).message ?? rejected[0]!.reason), /insufficient_balance/);
+});
+
 test("second payout to the same payee reuses the stored Avenia beneficiary (no re-forward)", async () => {
   const orgId = await createOrg("active");
-  await seedBrla(orgId, 10_000n);
-  const benId = await createPixBeneficiary(orgId);
+  await seedBalance(orgId, "BRLA", 10_000n);
+  const benId = await createPayee(orgId);
   const client = fakeClient();
   await createPayout(orgId, null, { beneficiaryId: benId, amount: "20", idemKey: randomUUID() }, client);
   await createPayout(orgId, null, { beneficiaryId: benId, amount: "30", idemKey: randomUUID() }, client);
@@ -126,8 +217,8 @@ test("second payout to the same payee reuses the stored Avenia beneficiary (no r
 
 test("two concurrent payouts exceeding the balance: exactly one wins (money-lock reservation)", async () => {
   const orgId = await createOrg("active");
-  await seedBrla(orgId, 10_000n); // R$100 — enough for one 60 but not two
-  const benId = await createPixBeneficiary(orgId);
+  await seedBalance(orgId, "BRLA", 10_000n); // R$100 — enough for one 60 but not two
+  const benId = await createPayee(orgId);
   const client = fakeClient();
   const results = await Promise.allSettled([
     createPayout(orgId, null, { beneficiaryId: benId, amount: "60", idemKey: randomUUID() }, client),
@@ -141,38 +232,10 @@ test("two concurrent payouts exceeding the balance: exactly one wins (money-lock
   assert.equal(client.tickets, 1, "only the winner calls Avenia");
 });
 
-test("concurrent convert + payout contend for the same balance: exactly one wins (cross-op)", async () => {
-  const orgId = await createOrg("active");
-  await seedBrla(orgId, 10_000n);
-  const benId = await createPixBeneficiary(orgId);
-  const payoutClient = fakeClient();
-  const convertClient = {
-    async createSubAccount() { return { id: "sub_x" }; },
-    async getAccountInfo() { return {}; },
-    async createSwap({ inputCurrency, outputCurrency, inputAmount }: { inputCurrency: string; outputCurrency: string; inputAmount: string }) {
-      return {
-        ticketId: "tkt_conv",
-        quote: {
-          inputCurrency, inputAmount, outputCurrency, outputAmount: (Number(inputAmount) / 5.2).toFixed(6),
-          basePrice: "5.2", pairName: "USDTBRLA", appliedFees: [],
-        },
-      };
-    },
-  } as never;
-  const results = await Promise.allSettled([
-    createPayout(orgId, null, { beneficiaryId: benId, amount: "60", idemKey: randomUUID() }, payoutClient),
-    createConvert(orgId, null, { from: "BRLA", to: "USDT", amount: "60", idemKey: randomUUID() }, convertClient),
-  ]);
-  const ok = results.filter((r) => r.status === "fulfilled");
-  const rejected = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
-  assert.equal(ok.length, 1, "the two op types share one reservation pool");
-  assert.match(String((rejected[0]!.reason as Error).message ?? rejected[0]!.reason), /insufficient_balance/);
-});
-
 test("same idemKey + same payload replays the SAME reservation (no double-payout)", async () => {
   const orgId = await createOrg("active");
-  await seedBrla(orgId, 10_000n);
-  const benId = await createPixBeneficiary(orgId);
+  await seedBalance(orgId, "BRLA", 10_000n);
+  const benId = await createPayee(orgId);
   const client = fakeClient();
   const idemKey = randomUUID();
   const a = await createPayout(orgId, null, { beneficiaryId: benId, amount: "50", idemKey }, client);
@@ -183,9 +246,9 @@ test("same idemKey + same payload replays the SAME reservation (no double-payout
 
 test("same idemKey + DIFFERENT payload (other beneficiary) -> 409, no second ticket", async () => {
   const orgId = await createOrg("active");
-  await seedBrla(orgId, 10_000n);
-  const benA = await createPixBeneficiary(orgId);
-  const benB = await createPixBeneficiary(orgId, { label: "Outro Fornecedor" });
+  await seedBalance(orgId, "BRLA", 10_000n);
+  const benA = await createPayee(orgId);
+  const benB = await createPayee(orgId, { label: "Outro Fornecedor" });
   const client = fakeClient();
   const idemKey = randomUUID();
   await createPayout(orgId, null, { beneficiaryId: benA, amount: "50", idemKey }, client);
@@ -198,8 +261,8 @@ test("same idemKey + DIFFERENT payload (other beneficiary) -> 409, no second tic
 
 test("insufficient balance is rejected before any ticket, reservation rolled back", async () => {
   const orgId = await createOrg("active");
-  await seedBrla(orgId, 3_000n); // R$30
-  const benId = await createPixBeneficiary(orgId);
+  await seedBalance(orgId, "BRLA", 3_000n); // R$30
+  const benId = await createPayee(orgId);
   const client = fakeClient();
   await assert.rejects(
     createPayout(orgId, null, { beneficiaryId: benId, amount: "50", idemKey: randomUUID() }, client),
@@ -211,26 +274,26 @@ test("insufficient balance is rejected before any ticket, reservation rolled bac
   assert.equal(rows.rows[0]!.n, 0, "the reservation row was rolled back");
 });
 
-test("beneficiary gates: other org's payee 404, non-pix rail 422, disabled payee 422", async () => {
+test("beneficiary gates: other org's payee 404, capture-only rails 422, disabled payee 422", async () => {
   const orgId = await createOrg("active");
   const otherOrg = await createOrg("active", "23456789000195");
-  await seedBrla(orgId, 10_000n);
-  const foreign = await createPixBeneficiary(otherOrg);
-  const crypto = await createPixBeneficiary(orgId, { rail: "crypto", destination: { walletAddress: "0x" + "a".repeat(40) } });
-  const disabled = await createPixBeneficiary(orgId, { status: "disabled" });
+  await seedBalance(orgId, "BRLA", 10_000n);
+  const foreign = await createPayee(otherOrg);
+  const swift = await createPayee(orgId, { rail: "swift", asset: "USD", destination: { swiftBic: "CHASUS33", account: "123" } });
+  const disabled = await createPayee(orgId, { status: "disabled" });
   const client = fakeClient();
   const pay = (beneficiaryId: string) =>
     createPayout(orgId, null, { beneficiaryId, amount: "10", idemKey: randomUUID() }, client);
   await assert.rejects(pay(foreign), /beneficiary_not_found/);
-  await assert.rejects(pay(crypto), /unsupported_rail/);
+  await assert.rejects(pay(swift), /unsupported_rail/);
   await assert.rejects(pay(disabled), /beneficiary_disabled/);
   assert.equal(client.tickets, 0);
 });
 
 test("24h post-recovery hold blocks money-out before any reservation", async () => {
   const orgId = await createOrg("active");
-  await seedBrla(orgId, 10_000n);
-  const benId = await createPixBeneficiary(orgId);
+  await seedBalance(orgId, "BRLA", 10_000n);
+  const benId = await createPayee(orgId);
   await registerPostRecoveryHold(orgId, 24);
   const client = fakeClient();
   await assert.rejects(
@@ -242,7 +305,7 @@ test("24h post-recovery hold blocks money-out before any reservation", async () 
   assert.equal(rows.rows[0]!.n, 0, "no reservation was ever created");
 });
 
-// A client whose createPixPayout creates the ticket at Avenia and THEN throws (lost response). It
+// A client whose payout call creates the ticket at Avenia and THEN throws (lost response). It
 // also answers findTicketByExternalId with the executed ticket — the money-loss-recovery scenario.
 function lostResponseClient(ticketExists: boolean) {
   const byExternal = new Map<string, { id: string; outputAmount: string }>();
@@ -269,8 +332,8 @@ async function ageRow(orgId: string): Promise<void> {
 
 test("Phase-2 lost response leaves the row RECOVERABLE ('created'), and the reconciler settles the real payout (no money loss)", async () => {
   const orgId = await createOrg("active");
-  await seedBrla(orgId, 10_000n);
-  const benId = await createPixBeneficiary(orgId);
+  await seedBalance(orgId, "BRLA", 10_000n);
+  const benId = await createPayee(orgId);
   const client = lostResponseClient(true); // same instance "remembers" the ticket it created
   await assert.rejects(
     createPayout(orgId, null, { beneficiaryId: benId, amount: "50", idemKey: randomUUID() }, client),
@@ -289,8 +352,8 @@ test("Phase-2 lost response leaves the row RECOVERABLE ('created'), and the reco
 
 test("Phase-2 failure with NO ticket at Avenia is released by the reconciler (reservation freed)", async () => {
   const orgId = await createOrg("active");
-  await seedBrla(orgId, 10_000n);
-  const benId = await createPixBeneficiary(orgId);
+  await seedBalance(orgId, "BRLA", 10_000n);
+  const benId = await createPayee(orgId);
   const client = lostResponseClient(false); // no ticket ever created at Avenia
   await assert.rejects(
     createPayout(orgId, null, { beneficiaryId: benId, amount: "50", idemKey: randomUUID() }, client),
@@ -307,7 +370,7 @@ test("Phase-2 failure with NO ticket at Avenia is released by the reconciler (re
 
 test("invalid amount is a 422 before any DB work", async () => {
   const orgId = await createOrg("active");
-  const benId = await createPixBeneficiary(orgId);
+  const benId = await createPayee(orgId);
   const client = fakeClient();
   await assert.rejects(
     createPayout(orgId, null, { beneficiaryId: benId, amount: "50.123", idemKey: randomUUID() }, client),

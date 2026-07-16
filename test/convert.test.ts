@@ -2,30 +2,17 @@
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { pool, withTransaction } from "../src/db/pool.js";
+import { pool } from "../src/db/pool.js";
 import { createConvert, type ConvertClient } from "../src/modules/money/convert.js";
 import { reconcileInFlightTickets } from "../src/modules/money/moneyLoop.js";
-import { ensureAccount, postBalancedTransactionOn, balancesForOrg } from "../src/modules/ledger/ledger.service.js";
-import { drainWebhooks } from "../src/modules/webhooks/processor.js";
-import { resetDb, createOrg } from "./helpers.js";
+import { balancesForOrg } from "../src/modules/ledger/ledger.service.js";
+import { resetDb, createOrg, seedBalance, settleTicket } from "./helpers.js";
 
 beforeEach(resetDb);
 after(() => pool.end());
 
-// A settled BRLA balance for an org (mirrors a deposit settle: custody +minor / org liability -minor).
-async function seedBrla(orgId: string, minor: bigint): Promise<void> {
-  await withTransaction(async (c) => {
-    const custody = await ensureAccount(c, { key: `avenia:custody:BRLA`, type: "vendor_asset", currency: "BRLA" });
-    const org = await ensureAccount(c, { key: `org:${orgId}:BRLA`, type: "customer_liability", orgId, currency: "BRLA" });
-    await postBalancedTransactionOn(c, {
-      description: "seed",
-      postings: [
-        { accountId: custody, amount: minor, currency: "BRLA" },
-        { accountId: org, amount: -minor, currency: "BRLA" },
-      ],
-    });
-  });
-}
+const seedBrla = (orgId: string, minor: bigint) => seedBalance(orgId, "BRLA", minor);
+const settle = settleTicket;
 
 function fakeClient() {
   let tickets = 0;
@@ -48,15 +35,6 @@ function fakeClient() {
     },
   } as never;
   return client;
-}
-
-async function settle(vendorRef: string): Promise<void> {
-  await pool.query(
-    `insert into webhook_events (provider_code, external_event_id, event_type, payload)
-     values ('avenia', $1, 'TICKET-PAID', $2)`,
-    [randomUUID(), JSON.stringify({ event: { id: randomUUID(), data: { type: "TICKET-PAID", ticket: { id: vendorRef, status: "PAID" } } } })],
-  );
-  await drainWebhooks();
 }
 
 test("createConvert: reserves, swaps, and settle posts a balanced 4-leg entry", async () => {

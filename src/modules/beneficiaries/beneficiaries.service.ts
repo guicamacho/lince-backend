@@ -9,6 +9,7 @@
 import { pool, withTransaction } from "../../db/pool.js";
 import { enqueueNotification } from "../notifications/outbox.js";
 import { validateBeneficiary } from "./rails.js";
+import { HttpError } from "../../http/error.js";
 import type { PayoutRail } from "../providers/avenia/avenia.client.js";
 
 /** The columns a payout needs to validate + forward a payee. */
@@ -17,13 +18,17 @@ export interface PayoutBeneficiary {
   rail: string | null;
   status: string;
   label: string;
-  destination: { pixKey?: string } | null;
+  asset: string | null; // dest_currency: BRL | USD | USDT | USDC | ...
+  network: string | null; // crypto chain label, else null
+  payee_legal_name: string | null;
+  destination: Record<string, string> | null;
   avenia_beneficiary_id: string | null;
 }
 
 export async function getPayoutBeneficiary(orgId: string, beneficiaryId: string): Promise<PayoutBeneficiary | null> {
   const { rows } = await pool.query<PayoutBeneficiary>(
-    `select id, rail, status, label, destination, avenia_beneficiary_id
+    `select id, rail, status, label, dest_currency as asset, network, payee_legal_name,
+            destination, avenia_beneficiary_id
        from avenia_beneficiaries where id = $1 and org_id = $2`,
     [beneficiaryId, orgId],
   );
@@ -31,8 +36,10 @@ export async function getPayoutBeneficiary(orgId: string, beneficiaryId: string)
 }
 
 /**
- * Lazily forward a PIX payee to Avenia on first use (the "forwarded later" seam from 0004).
- * Returns the Avenia-side beneficiaryBrlBankAccountId. External call with NO lock held.
+ * Lazily forward a bank-rail payee to Avenia on first use (the "forwarded later" seam from
+ * 0004): PIX -> /brl/ with the key, ACH/Fedwire -> /usd/ with the full bank record. Crypto
+ * payees are never forwarded (the wallet rides inline in the ticket). Returns the Avenia-side
+ * beneficiary id. External call with NO lock held.
  * ponytail: no claim row — two racing first-payouts may both register at Avenia; first UPDATE
  * wins here and the loser's vendor record sits orphaned at Avenia (cosmetic; deletable). Add
  * the avenia_accounts-style claim if orphans ever matter.
@@ -44,9 +51,36 @@ export async function ensureAveniaBeneficiary(
   client: PayoutRail,
 ): Promise<string> {
   if (beneficiary.avenia_beneficiary_id) return beneficiary.avenia_beneficiary_id;
-  const pixKey = beneficiary.destination?.pixKey;
-  if (!pixKey) throw new Error("beneficiary has no pixKey"); // rail gate upstream makes this unreachable
-  const created = await client.createBrlBeneficiary({ subAccountId, alias: beneficiary.label, pixKey });
+  const d = beneficiary.destination ?? {};
+  let created: { id: string };
+  if (beneficiary.rail === "pix") {
+    if (!d.pixKey) throw new HttpError("beneficiary_incomplete", 422);
+    created = await client.createBrlBeneficiary({ subAccountId, alias: beneficiary.label, pixKey: d.pixKey });
+  } else if (beneficiary.rail === "ach" || beneficiary.rail === "fedwire") {
+    // Pre-2026-07-15 USD payees miss bankName/address (rails.ts didn't capture them yet):
+    // a clean 422 tells the customer to complete the record, never a half-formed registration.
+    if (!d.accountNumber || !d.routingNumber || !d.bankName || !d.streetLine1 || !d.city || !d.state || !d.postalCode) {
+      throw new HttpError("beneficiary_incomplete", 422);
+    }
+    created = await client.createUsdBeneficiary({
+      subAccountId,
+      alias: beneficiary.label,
+      bankAccountNumber: d.accountNumber,
+      bankRoutingNumber: d.routingNumber,
+      bankBeneficiaryName: beneficiary.payee_legal_name ?? beneficiary.label,
+      bankName: d.bankName,
+      beneficiaryAddress: {
+        streetLine1: d.streetLine1,
+        ...(d.streetLine2 ? { streetLine2: d.streetLine2 } : {}),
+        city: d.city,
+        state: d.state,
+        postalCode: d.postalCode,
+        country: "USA", // ach/fedwire rails are US-fixed (rails.ts)
+      },
+    });
+  } else {
+    throw new HttpError("unsupported_rail", 422); // crypto never registers; others aren't payable
+  }
   const upd = await pool.query(
     `update avenia_beneficiaries set avenia_beneficiary_id = $2
       where id = $1 and avenia_beneficiary_id is null`,
