@@ -5,9 +5,143 @@
  * lands here as runMoneyLoop — extracted from convert/payout.)
  */
 import { pool, withTransaction } from "../../db/pool.js";
+import { HttpError } from "../../http/error.js";
 import { vendorMinor, type Currency } from "../../money/money.js";
+import { acquireOrgMoneyLock } from "../../db/lockKeys.js";
+import { ensureAveniaSubaccount } from "../onboarding/aveniaProvisioning.js";
 import { applyTicketStatus, APPLY_ROW_COLUMNS, type ApplyRow } from "./ticketApply.js";
-import type { TicketReader } from "../providers/avenia/avenia.client.js";
+import type { TicketReader, SubAccountCreator, AveniaSwapResult } from "../providers/avenia/avenia.client.js";
+
+/** Superset row both money-out flows project their receipts from. */
+export interface MoneyTxRow {
+  id: string;
+  state: string;
+  payload_hash: string | null;
+  beneficiary_id: string | null;
+  source_currency: string;
+  source_amount: string;
+  dest_currency: string;
+  dest_amount: string | null;
+  quote: Record<string, unknown> | null;
+}
+
+const TX_COLUMNS = "id, state, payload_hash, beneficiary_id, source_currency, source_amount, dest_currency, dest_amount, quote";
+
+/**
+ * The PRD-07 §2 two-phase money-out loop shared by Convert and Payouts. The parts that must
+ * never diverge are fixed here:
+ *
+ *   Phase 1 (under the per-org advisory money lock): reserve — insert a 'created' row and confirm
+ *     settled(src) - Σ(in-flight outbound reservations in src) >= 0, computed in ONE snapshot
+ *     query so a concurrent settle can't read-skew it. Overcommit rolls the reservation back.
+ *     Replay of the same (org, idemKey) returns the existing row; a different payload is a 409.
+ *   Phase 2 (NO lock held): the rail's Avenia call via the `phase2` closure. On ANY error the
+ *     row stays 'created' — a ticket auto-executes the instant it is POSTed, so marking 'failed'
+ *     on a lost response would strand executed money (the reconciler skips 'failed' and the PAID
+ *     webhook can't match a null vendor_ref). reconcileInFlightTickets settles or releases it.
+ *
+ * Settle stays in ticketApply.ts. Deposits do NOT ride this loop on purpose: a PIX-in charge
+ * takes no lock, reserves nothing, and safely marks 'failed' on error.
+ */
+export async function runMoneyLoop<R>(args: {
+  orgId: string;
+  initiatedByPersonId: string | null;
+  idemKey: string;
+  type: "convert_and_send" | "payout";
+  hash: string; // sha256 of the caller's canonical payload — binds idemKey to the request
+  sourceCurrency: Currency;
+  sourceAmount: bigint;
+  destCurrency: Currency; // used for vendorMinor(outputAmount) on the funding update
+  beneficiaryId: string | null;
+  client: SubAccountCreator; // for the org subaccount; phase2 closes over the full rail client
+  phase2: (subAccountId: string) => Promise<AveniaSwapResult>;
+  auditEvent: string;
+  auditPayload: Record<string, unknown>;
+  receipt: (row: MoneyTxRow) => R;
+  pendingCode: string; // *_pending_reconcile
+  conflictCode: string; // *_conflict_retry
+}): Promise<R> {
+  // PHASE 1 — reserve under the per-org money lock (advisory xact lock auto-releases on commit).
+  const reservation = await withTransaction(async (c) => {
+    await acquireOrgMoneyLock(c, args.orgId);
+    const claim = await c.query<{ id: string }>(
+      `insert into org_transactions
+         (org_id, type, state, initiated_by_user_id, beneficiary_id, source_currency, source_amount,
+          dest_currency, provider_code, idem_key, payload_hash)
+       values ($1, $2, 'created', $3, $4, $5, $6, $7, 'avenia', $8, $9)
+       on conflict (org_id, idem_key) do nothing
+       returning id`,
+      [args.orgId, args.type, args.initiatedByPersonId, args.beneficiaryId,
+       args.sourceCurrency, args.sourceAmount, args.destCurrency, args.idemKey, args.hash],
+    );
+    if (!claim.rowCount) {
+      // Replay: return the existing reservation, no new hold, no balance re-check.
+      const { rows } = await c.query<MoneyTxRow>(
+        `select ${TX_COLUMNS} from org_transactions where org_id = $1 and idem_key = $2`,
+        [args.orgId, args.idemKey],
+      );
+      const existing = rows[0];
+      if (!existing) throw new HttpError(args.conflictCode, 409);
+      if (existing.payload_hash !== args.hash) throw new HttpError("idem_key_payload_mismatch", 409);
+      return { replay: true as const, row: existing };
+    }
+    // Settled(src) - Σ(in-flight outbound reservations in src), including the row just inserted,
+    // in ONE snapshot. < 0 means this reservation overcommits -> throw rolls it back.
+    const { rows } = await c.query<{ available: string }>(
+      `select
+         coalesce((select -sum(p.amount) from ledger_postings p
+                     join ledger_accounts a on a.id = p.account_id
+                    where a.org_id = $1 and a.type = 'customer_liability' and a.currency = $2), 0)
+       - coalesce((select sum(t.source_amount) from org_transactions t
+                    where t.org_id = $1 and t.type in ('convert_and_send', 'payout') and t.source_currency = $2
+                      and t.state in ('created', 'funding', 'executing', 'on_hold')), 0) as available`,
+      [args.orgId, args.sourceCurrency],
+    );
+    if (BigInt(rows[0]!.available) < 0n) throw new HttpError("insufficient_balance", 422);
+    return { replay: false as const, txId: claim.rows[0]!.id };
+  });
+  if (reservation.replay) return args.receipt(reservation.row);
+  const txId = reservation.txId;
+
+  // PHASE 2 — no lock held: subaccount, then the rail's Avenia call.
+  let result;
+  try {
+    const sub = await ensureAveniaSubaccount(args.orgId, args.client);
+    if (!sub) throw new Error("no subaccount");
+    result = await args.phase2(sub);
+  } catch (e) {
+    // Do NOT mark 'failed' here — see the module doc. Record the error only.
+    await pool.query(
+      `update org_transactions set error = $2, updated_at = now() where id = $1 and state = 'created'`,
+      [txId, JSON.stringify({ stage: "create", message: e instanceof Error ? e.message : String(e) })],
+    );
+    throw e instanceof HttpError ? e : new HttpError(args.pendingCode, 502);
+  }
+
+  const destMinor = vendorMinor(result.quote.outputAmount, args.destCurrency);
+  const quoteSnapshot = {
+    ticketStatus: "UNPAID",
+    basePrice: result.quote.basePrice,
+    pairName: result.quote.pairName,
+    inputAmount: result.quote.inputAmount,
+    outputAmount: result.quote.outputAmount,
+    appliedFees: result.quote.appliedFees,
+  };
+  const upd = await pool.query<MoneyTxRow>(
+    `update org_transactions
+        set state = 'funding', vendor_ref = $2, dest_amount = $3, quote = $4, updated_at = now()
+      where id = $1
+      returning ${TX_COLUMNS}`,
+    [txId, result.ticketId, destMinor, JSON.stringify(quoteSnapshot)],
+  );
+  await pool.query(
+    `insert into audit_log (org_id, actor_type, actor_id, event, payload)
+     values ($1, $2, $3, $4, $5)`,
+    [args.orgId, args.initiatedByPersonId ? "user" : "system", args.initiatedByPersonId,
+     args.auditEvent, JSON.stringify({ txId, vendorRef: result.ticketId, ...args.auditPayload })],
+  );
+  return args.receipt(upd.rows[0]!);
+}
 
 export interface MappedFee {
   label: string;
