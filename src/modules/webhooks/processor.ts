@@ -13,6 +13,7 @@ import type pg from "pg";
 import { pool, withTransaction } from "../../db/pool.js";
 import { linkClerkUserFromEvent, type ClerkUserEvent } from "../identity/clerkSync.js";
 import { applyTicketStatus, APPLY_ROW_COLUMNS, type ApplyRow } from "../money/ticketApply.js";
+import { enqueueAdminAlert } from "../notifications/outbox.js";
 
 export interface WebhookEventRow {
   id: string;
@@ -66,9 +67,30 @@ const aveniaHandler: WebhookHandler = async (client, row) => {
   }
 };
 
+/**
+ * Resend delivery events (Svix-verified at intake). A hard bounce or a spam complaint
+ * suppresses the address: future customer sends to it dead-letter instead of burning
+ * sender reputation. The already-'sent' outbox row stays 'sent' — the API send DID
+ * succeed; suppression is forward-looking only.
+ */
+const resendHandler: WebhookHandler = async (client, row) => {
+  const p = row.payload as { type?: string; data?: { email_id?: string; to?: string | string[] } } | null;
+  const reason = p?.type === "email.bounced" ? "bounced" : p?.type === "email.complained" ? "complained" : null;
+  if (!reason) return; // delivered/opened/etc — stored, no action
+  const tos = Array.isArray(p?.data?.to) ? p.data.to : p?.data?.to ? [p.data.to] : [];
+  for (const addr of tos) {
+    await client.query(
+      `insert into notification_suppressions (email, reason, source_ref)
+       values (lower($1), $2, $3) on conflict (email) do nothing`,
+      [String(addr), reason, p?.data?.email_id ?? null],
+    );
+  }
+};
+
 const DEFAULT_HANDLERS: Record<string, WebhookHandler> = {
   clerk: clerkHandler,
   avenia: aveniaHandler,
+  resend: resendHandler,
 };
 
 /**
@@ -96,12 +118,22 @@ export async function processWebhookEvent(
     await client.query("rollback to savepoint webhook_row");
     const attempts = row.attempts + 1;
     const status = attempts >= maxAttempts ? "dead" : "failed";
+    const message = err instanceof Error ? err.message : String(err);
     await client.query(`update webhook_events set status = $2, attempts = $3, last_error = $4 where id = $1`, [
       row.id,
       status,
       attempts,
-      err instanceof Error ? err.message : String(err),
+      message,
     ]);
+    // A dead event = a delivery we will never process without ops action (§4.8 replay).
+    if (status === "dead") {
+      await enqueueAdminAlert(client, "webhook_dead", {
+        eventId: row.id,
+        provider: row.provider_code,
+        eventType: row.event_type,
+        error: message,
+      });
+    }
   }
 }
 

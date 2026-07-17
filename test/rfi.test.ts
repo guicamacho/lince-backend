@@ -30,6 +30,13 @@ test("raiseRfi: org -> rfi_required, customer-visible thread + neutral ping, aud
 
   const audit = await pool.query("select 1 from audit_log where org_id = $1 and event = 'admission.rfi_relayed'", [org]);
   assert.equal(audit.rowCount, 1);
+
+  // Email ping enqueued in the same tx (neutral template; detail stays behind login).
+  const outbox = await pool.query(
+    "select 1 from notification_outbox where event_type = 'rfi_requested' and recipient_ref = $1",
+    [org],
+  );
+  assert.equal(outbox.rowCount, 1);
 });
 
 test("raiseRfi reuses the open rfi_relay case across rounds (no case-per-message)", async () => {

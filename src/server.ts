@@ -9,6 +9,7 @@ import { drainWebhooks } from "./modules/webhooks/processor.js";
 import { drainOutboxOnce } from "./modules/notifications/outbox.js";
 import { reconcileInFlightTickets } from "./modules/money/moneyLoop.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
+import { alertSlaBreachesOnce } from "./modules/admin/aging.js";
 
 const DRAIN_INTERVAL_MS = Number(process.env.DRAIN_INTERVAL_MS ?? 5000);
 
@@ -41,6 +42,9 @@ export function startServer(app: Express): void {
         // settle path in local dev, where webhooks point at the deployed endpoint.
         const avenia = aveniaFromEnv();
         if (avenia && tick % 12 === 0) await reconcileInFlightTickets(avenia);
+        // Admission-SLA sweep: shortly after boot, then hourly (720 ticks at 5s). The
+        // exists-dedupe inside makes any cadence safe.
+        if (tick === 1 || tick % 720 === 0) await alertSlaBreachesOnce(env.sla.admissionDays);
       } catch (err) {
         console.warn("drain.tick_failed", err instanceof Error ? err.message : String(err));
       } finally {

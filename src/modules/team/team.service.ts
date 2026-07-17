@@ -16,6 +16,7 @@ import type pg from "pg";
 import { pool, withTransaction } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
 import { ACCESS_ROLES, accessRoles, type AccessRole } from "../access/permissions.js";
+import { enqueueNotification } from "../notifications/outbox.js";
 
 export type AssignableRole = Exclude<AccessRole, "owner">;
 const ASSIGNABLE: readonly AssignableRole[] = ["admin", "finance", "viewer"];
@@ -338,5 +339,24 @@ export async function transferOwnership(
       [orgId, targetPersonId],
     );
     await audit(c, orgId, ownerPersonId, "ownership.transferred", { from: ownerPersonId, to: targetPersonId });
+
+    // Security notice to BOTH parties (same tx). Literal-email refs: the org ref would
+    // resolve to the NEW owner only, and the demoted owner is exactly who must notice a
+    // transfer they didn't make.
+    const people = await c.query<{ id: string; email: string; full_name: string }>(
+      `select id, email, full_name from people where id = any($1::uuid[])`,
+      [[ownerPersonId, targetPersonId]],
+    );
+    const byId = new Map(people.rows.map((p) => [p.id, p]));
+    const fromName = byId.get(ownerPersonId)?.full_name ?? "";
+    const toName = byId.get(targetPersonId)?.full_name ?? "";
+    for (const p of people.rows) {
+      await enqueueNotification(c, {
+        eventType: "ownership_transferred",
+        recipientRef: p.email,
+        templateId: "ownership_transferred",
+        payload: { fromName, toName },
+      });
+    }
   });
 }

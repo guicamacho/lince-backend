@@ -16,7 +16,9 @@ import type { NotifyConfig, SendAdapter } from "../src/modules/notifications/ada
 
 const cfg: NotifyConfig = { emailAdapter: "log" }; // LogAdapter for every class — never networks
 
-const uniq = () => `obtest:${randomUUID()}`;
+// Contains "@" -> the drain's literal-email path (org-ref resolution has its own suite,
+// notificationDelivery.test.ts); still "obtest:"-prefixed so cleanup stays scoped.
+const uniq = () => `obtest:${randomUUID()}@test.lince`;
 const cleanup = () => pool.query("delete from notification_outbox where recipient_ref like 'obtest:%'");
 
 beforeEach(cleanup);

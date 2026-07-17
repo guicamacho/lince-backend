@@ -8,7 +8,7 @@ import type { Currency } from "../src/money/money.js";
 // Data tables to clear between tests. Seed tables (jurisdiction_policies, providers,
 // provider_currencies) are intentionally NOT truncated.
 const DATA_TABLES = [
-  "recon_breaks", "recon_runs", "notification_outbox", "rate_limits",
+  "recon_breaks", "recon_runs", "notification_outbox", "notification_suppressions", "rate_limits",
   "document_uploads", "audit_log", "cnpj_denylist", "webhook_events",
   "customer_notifications", "case_messages", "cases",
   "ledger_postings", "ledger_transactions", "ledger_accounts", "org_transactions",

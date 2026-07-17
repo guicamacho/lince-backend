@@ -3,12 +3,18 @@
  *
  * enqueueNotification writes a row using the CALLER's transaction client, so a
  * notification exists iff the triggering change commits (acceptance #1). The drain
- * worker claims queued/retryable rows with FOR UPDATE SKIP LOCKED, renders + sends via
- * the selected adapter, and records a system audit_log entry on success (acceptance #4).
+ * worker resolves the recipient to an address, checks the suppression list, renders +
+ * sends via the selected adapter, and records a system audit_log entry on success
+ * (acceptance #4).
  *
- * ponytail: in-process drain (drainOutboxOnce) called from app.ts's guarded scheduler on
- *   the single always-on machine. SKIP LOCKED makes a second instance safe (wasteful, not
- *   wrong); move to a dedicated worker only if volume grows.
+ * Recipient resolution (Cluster 1): recipient_ref containing "@" is a literal email;
+ * anything else is treated as an org id and resolves to the org's ACTIVE OWNER's email
+ * at send time. Unresolvable or suppressed recipients dead-letter the row (never a
+ * retry loop — the ref won't get better).
+ *
+ * ponytail: in-process drain (drainOutboxOnce) called from the server's guarded scheduler
+ *   on the single always-on machine. SKIP LOCKED makes a second instance safe (wasteful,
+ *   not wrong); move to a dedicated worker only if volume grows.
  */
 import type pg from "pg";
 import { withTransaction } from "../../db/pool.js";
@@ -21,7 +27,7 @@ const BATCH = 20;
 
 export interface EnqueueInput {
   eventType: string;
-  recipientRef: string; // who to notify (org id in P1; resolved to an address at send time)
+  recipientRef: string; // org id (resolved to the owner's email at send time) or a literal email
   templateId: TemplateId;
   templateVersion?: number;
   payload?: Record<string, unknown>;
@@ -43,6 +49,26 @@ export async function enqueueNotification(client: pg.PoolClient, input: EnqueueI
       JSON.stringify(input.payload ?? {}),
     ],
   );
+}
+
+/**
+ * Ops alert (Slack, or LogAdapter when unconfigured) through the same outbox: durable and
+ * transactional with the triggering change, drained by the same worker. SlackAdapter
+ * ignores recipient_ref — callers that need dedupe (the SLA sweep) pass a meaningful ref
+ * and query on it; everyone else takes the default "ops".
+ */
+export async function enqueueAdminAlert(
+  client: pg.PoolClient,
+  kind: string,
+  detail: Record<string, unknown>,
+  recipientRef = "ops",
+): Promise<void> {
+  await enqueueNotification(client, {
+    eventType: kind,
+    recipientRef,
+    templateId: "admin_alert",
+    payload: { title: kind, detail: JSON.stringify(detail) },
+  });
 }
 
 interface OutboxRow {
@@ -88,17 +114,45 @@ export async function drainOutboxOnce(cfg: NotifyConfig, select: SelectAdapter =
   });
 }
 
+/**
+ * recipient_ref -> deliverable email. Literal emails pass through lowercased; anything
+ * else is an org id -> the active owner's login email (PRD-06 §2A: the owner is the
+ * accountable recipient; per-member routing is a later phase). org_id::text avoids a
+ * uuid cast throw on a malformed ref — malformed just resolves to null and dead-letters.
+ */
+async function resolveRecipientEmail(client: pg.PoolClient, ref: string): Promise<string | null> {
+  if (ref.includes("@")) return ref.toLowerCase();
+  const { rows } = await client.query<{ email: string }>(
+    `select p.email
+       from org_people op join people p on p.id = op.person_id
+      where op.org_id::text = $1 and 'owner' = any(op.roles) and op.status = 'active'
+      limit 1`,
+    [ref],
+  );
+  return rows[0]?.email.toLowerCase() ?? null;
+}
+
 async function processRow(client: pg.PoolClient, cfg: NotifyConfig, select: SelectAdapter, row: OutboxRow): Promise<void> {
   const template = getTemplate(row.template_id);
-  if (!template) return markDead(client, row.id, "unknown_template");
+  if (!template) return markDead(client, row, "unknown_template");
   // Tipping-off gate: a non-admin template that hasn't been review-cleared never sends.
-  if (!isSendable(template)) return markDead(client, row.id, "tipping_off_unreviewed");
+  if (!isSendable(template)) return markDead(client, row, "tipping_off_unreviewed");
+
+  // Customer/payee sends go to a real address; admin sends go to Slack (ref unused).
+  let to = row.recipient_ref;
+  if (template.recipientClass !== "admin") {
+    const email = await resolveRecipientEmail(client, row.recipient_ref);
+    if (!email) return markDead(client, row, "recipient_unresolved");
+    const suppressed = await client.query(`select 1 from notification_suppressions where email = $1`, [email]);
+    if (suppressed.rowCount) return markDead(client, row, "recipient_suppressed");
+    to = email;
+  }
 
   const rendered = renderTemplate(row.template_id as TemplateId, row.payload);
   const adapter = select(template.recipientClass, cfg);
   let result;
   try {
-    result = await adapter.send(rendered, row.recipient_ref, row.id);
+    result = await adapter.send(rendered, to, row.id);
   } catch (err) {
     result = { ok: false as const, error: String(err) };
   }
@@ -110,23 +164,39 @@ async function processRow(client: pg.PoolClient, cfg: NotifyConfig, select: Sele
       [JSON.stringify({ outboxId: row.id, templateId: row.template_id, providerRef: result.providerRef })],
     );
     await client.query(
-      `update notification_outbox set status = 'sent', sent_at = now(), attempts = attempts + 1, audit_ref = $2 where id = $1`,
-      [row.id, rows[0]!.id],
+      `update notification_outbox
+          set status = 'sent', sent_at = now(), attempts = attempts + 1, audit_ref = $2, provider_ref = $3
+        where id = $1`,
+      [row.id, rows[0]!.id, result.providerRef || null],
     );
   } else {
     const next = row.attempts + 1;
     // ponytail: no last_error column on notification_outbox (schema is fixed this session);
     //   the failure reason is logged, not persisted. Add a column if ops needs it in-row.
     console.warn("notify.send_failed", { outboxId: row.id, attempt: next, error: result.error });
+    const dead = next >= MAX_ATTEMPTS;
     await client.query(
       `update notification_outbox set status = $2, attempts = $3 where id = $1`,
-      [row.id, next >= MAX_ATTEMPTS ? "dead" : "failed", next],
+      [row.id, dead ? "dead" : "failed", next],
     );
+    if (dead) await alertDeadRow(client, row, result.error);
   }
 }
 
-/** Refuse without sending — unknown template or tipping-off-unreviewed copy. */
-async function markDead(client: pg.PoolClient, id: string, reason: string): Promise<void> {
-  console.warn("notify.refused", { outboxId: id, reason });
-  await client.query(`update notification_outbox set status = 'dead' where id = $1`, [id]);
+/** Refuse without sending — unknown template, unreviewed copy, or unusable recipient. */
+async function markDead(client: pg.PoolClient, row: OutboxRow, reason: string): Promise<void> {
+  console.warn("notify.refused", { outboxId: row.id, reason });
+  await client.query(`update notification_outbox set status = 'dead' where id = $1`, [row.id]);
+  await alertDeadRow(client, row, reason);
+}
+
+/** Every dead-lettered notification pings ops — EXCEPT dead alerts themselves (no cycles). */
+async function alertDeadRow(client: pg.PoolClient, row: OutboxRow, reason: string): Promise<void> {
+  if (row.template_id === "admin_alert") return;
+  await enqueueAdminAlert(client, "notification_dead", {
+    outboxId: row.id,
+    templateId: row.template_id,
+    recipientRef: row.recipient_ref,
+    reason,
+  });
 }

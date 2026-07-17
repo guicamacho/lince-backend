@@ -15,8 +15,9 @@ import type pg from "pg";
 import { ticketTransitionAllowed, normalizeTicketStatus } from "../webhooks/ticketState.js";
 import { ensureAccount, postBalancedTransactionOn } from "../ledger/ledger.service.js";
 import { DuplicateLedgerPostError } from "../ledger/ledger.types.js";
+import { enqueueNotification } from "../notifications/outbox.js";
 import type { TicketState } from "../providers/provider.types.js";
-import type { Currency } from "../../money/money.js";
+import { fromMinor, type Currency } from "../../money/money.js";
 
 /** Avenia ticket status -> Lince org_transactions.state (deposit lifecycle). */
 export const TICKET_TO_TX_STATE: Record<string, string> = {
@@ -148,5 +149,44 @@ export async function applyTicketStatus(
       if (!(e instanceof DuplicateLedgerPostError)) throw e; // idempotent replay — never double-post
     }
   }
+
+  // Customer notification on the terminal outcomes (PRD-06 §2C), same tx as the state
+  // change. Exactly-once rides the monotonic guard above: a replayed status returns
+  // "ignore"/"reject" before reaching here. on_hold/cancelled notify nothing — a hold
+  // email is a tipping-off risk, and an unpaid-then-cancelled deposit is just noise.
+  if (nextState === "settled") {
+    await enqueueNotification(client, {
+      eventType: "ticket_settled",
+      recipientRef: tx.org_id,
+      templateId: "ticket_paid",
+      payload: { summary: paidSummary(tx) },
+    });
+  } else if (nextState === "failed") {
+    await enqueueNotification(client, {
+      eventType: "ticket_failed",
+      recipientRef: tx.org_id,
+      templateId: "ticket_failed",
+    });
+  }
   return "apply";
+}
+
+const SYMBOL: Record<string, string> = { BRL: "R$", BRLA: "R$", USD: "US$", USDT: "US$", USDC: "US$", EUR: "€", EURC: "€" };
+
+function display(amount: string | null, ccy: string | null): string {
+  if (!amount || !ccy) return "";
+  return `${SYMBOL[ccy] ?? ccy} ${fromMinor(BigInt(amount), ccy as Currency).replace(".", ",")}`;
+}
+
+/** One pt-BR line per settled type, built from the row's ACTUAL amounts. */
+function paidSummary(tx: ApplyRow): string {
+  if (tx.type === "deposit") return `Depósito de ${display(tx.dest_amount, tx.dest_currency)} confirmado.`;
+  if (tx.type === "convert_and_send") {
+    return `Conversão concluída: ${display(tx.source_amount, tx.source_currency)} → ${display(tx.dest_amount, tx.dest_currency)}.`;
+  }
+  if (tx.type === "payout") {
+    const sent = tx.dest_amount ? display(tx.dest_amount, tx.dest_currency) : display(tx.source_amount, tx.source_currency);
+    return `Pagamento de ${sent} enviado.`;
+  }
+  return "Sua transação foi concluída.";
 }

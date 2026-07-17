@@ -296,6 +296,12 @@ test("transferOwnership: demote-then-promote in one tx; target must be an active
   assert.equal((await roles(adm)).includes("owner"), true);
   const audit = await pool.query(`select 1 from audit_log where org_id = $1 and event = 'ownership.transferred'`, [orgId]);
   assert.equal(audit.rowCount, 1);
+  // security notice enqueued to BOTH parties (literal-email refs), same tx
+  const ownerEmail = (await pool.query<{ email: string }>(`select email from people where id = $1`, [ownerId])).rows[0]!.email;
+  const notes = await pool.query<{ recipient_ref: string }>(
+    `select recipient_ref from notification_outbox where event_type = 'ownership_transferred'`,
+  );
+  assert.deepEqual(notes.rows.map((r) => r.recipient_ref).sort(), [ownerEmail, "adm@t.test"].sort());
   // viewer target rejected; self rejected; non-owner actor rejected
   const viewer = await makePerson("v@t.test");
   await addMembership(orgId, viewer, ["viewer"]);

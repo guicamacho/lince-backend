@@ -10,6 +10,7 @@
 import { pool, withTransaction } from "../../db/pool.js";
 import { assertTransition, type OrgState } from "../identity/org.state.js";
 import { HttpError } from "../../http/error.js";
+import { enqueueNotification } from "../notifications/outbox.js";
 
 export interface OrgSnapshot {
   orgId: string;
@@ -58,6 +59,15 @@ export async function advanceCallerOrg(clerkUserId: string, to: OrgState): Promi
         returning state, admission_state, access_status`,
       [org.id, to, stampForward],
     );
+    // The forward-to-review moment IS "we received your application" (PRD-06 §2B) —
+    // including an RFI re-forward, where a fresh "em análise" note is the right signal.
+    if (stampForward) {
+      await enqueueNotification(c, {
+        eventType: "application_received",
+        recipientRef: org.id,
+        templateId: "application_received",
+      });
+    }
     return {
       orgId: org.id,
       state: upd.rows[0]!.state,

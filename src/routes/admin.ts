@@ -80,17 +80,27 @@ export function registerAdminRoutes(app: Express): void {
     res.json({ documents: rows });
   });
 
-  // Events & Webhooks health (PRD-04 §4.8): processing status across providers. Failures are the
-  // actionable rows; the grid tabs by status client-side.
+  // Events & Webhooks health (PRD-04 §4.8): processing status across providers, plus
+  // outbound notifications that failed or dead-lettered (Cluster 1 — undeliverable mail
+  // is an ops-actionable failure, same as a dead webhook). The grid tabs client-side.
   app.get("/admin/webhooks", rateLimit("admin_export"), async (_req: Request, res: Response) => {
-    const { rows } = await pool.query(
-      `select id, provider_code, event_type, external_event_id, status, attempts, last_error,
-              received_at, processed_at
-         from webhook_events
-        order by (status in ('failed','dead')) desc, received_at desc
-        limit 200`,
-    );
-    res.json({ events: rows });
+    const [events, notifications] = await Promise.all([
+      pool.query(
+        `select id, provider_code, event_type, external_event_id, status, attempts, last_error,
+                received_at, processed_at
+           from webhook_events
+          order by (status in ('failed','dead')) desc, received_at desc
+          limit 200`,
+      ),
+      pool.query(
+        `select id, event_type, template_id, recipient_ref, status, attempts, created_at, sent_at
+           from notification_outbox
+          where status in ('failed','dead')
+          order by created_at desc
+          limit 100`,
+      ),
+    ]);
+    res.json({ events: events.rows, notifications: notifications.rows });
   });
 
   // Replay a failed/dead event back through the drain (idempotent handlers make it safe).

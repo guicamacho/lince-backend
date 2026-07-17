@@ -18,6 +18,7 @@ import { withTransaction } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
 import { canTransition, type OrgState } from "../identity/org.state.js";
 import { postAdminCaseMessageOn } from "../cases/messages.service.js";
+import { enqueueNotification } from "../notifications/outbox.js";
 
 export interface RaiseRfiInput {
   orgId: string;
@@ -75,6 +76,14 @@ export async function raiseRfi(input: RaiseRfiInput): Promise<{ caseId: string; 
        values ($1, 'ops', $2, 'admission.rfi_relayed', $3)`,
       [input.orgId, input.adminId, JSON.stringify({ relay: true, caseId, authority: "avenia" })],
     );
+
+    // Email ping on top of the in-app thread note (the poster above writes the bell).
+    // NEUTRAL copy — the EDD detail lives only behind login, in the case thread.
+    await enqueueNotification(c, {
+      eventType: "rfi_requested",
+      recipientRef: input.orgId,
+      templateId: "rfi_requested",
+    });
 
     return { caseId, state: "rfi_required" };
   });
