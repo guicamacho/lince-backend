@@ -27,7 +27,7 @@ async function createPayee(orgId: string, overrides: Record<string, unknown> = {
     `insert into avenia_beneficiaries
        (org_id, label, rail, dest_currency, network, destination, dest_hint, payee_legal_name,
         payee_country, purpose_of_payment, status)
-     values ($1, $2, $3, $4, $5, $6, '6c2c', 'Fornecedor Exemplo LTDA', 'BR', 'pagamento de fornecedor', $7)
+     values ($1, $2, $3, $4, $5, $6, '6c2c', 'Fornecedor Exemplo LTDA', $7, 'pagamento de fornecedor', $8)
      returning id`,
     [
       orgId,
@@ -36,6 +36,7 @@ async function createPayee(orgId: string, overrides: Record<string, unknown> = {
       (overrides.asset as string) ?? "BRL",
       (overrides.network as string) ?? null,
       JSON.stringify((overrides.destination as object) ?? PIX_DEST),
+      (overrides.payee_country as string) ?? "BR",
       (overrides.status as string) ?? "active",
     ],
   );
@@ -65,6 +66,14 @@ function fakeClient() {
     async createUsdBeneficiary(input: Record<string, unknown>) {
       forwards++; calls.push({ kind: "usd-beneficiary", ...input });
       return { id: `ben_${forwards}` };
+    },
+    async createEurBeneficiary(input: Record<string, unknown>) {
+      forwards++; calls.push({ kind: "eur-beneficiary", ...input });
+      return { id: `ben_${forwards}` };
+    },
+    async createSepaPayout(input: { inputAmount: string }) {
+      tickets++; calls.push({ kind: "sepa-payout", ...input });
+      return { ticketId: `tkt_${tickets}`, quote: quoteFor("EURC", input.inputAmount, "EUR") };
     },
     async createPixPayout(input: { inputCurrency: string; inputAmount: string }) {
       tickets++; calls.push({ kind: "pix-payout", ...input });
@@ -128,6 +137,28 @@ test("USD/ACH: funded from USDT, USD bank payee forwarded once, settle debits US
 
   await settleTicket("tkt_1");
   assert.equal((await balancesForOrg(orgId)).USDT, 10_000_000, "USDT debited by the reserved amount");
+});
+
+test("EUR/SEPA: funded from EURC, payee forwarded to /eur/ with alpha-3 country, settle debits EURC", async () => {
+  const orgId = await createOrg("active");
+  await seedBalance(orgId, "EURC", 20_000_000n); // 20 EURC
+  const benId = await createPayee(orgId, {
+    rail: "sepa", asset: "EUR",
+    destination: { iban: "DE89370400440532013000", bic: "COBADEFFXXX" },
+    payee_country: "DE",
+  });
+  const client = fakeClient();
+  const receipt = await createPayout(orgId, null, { beneficiaryId: benId, amount: "10", idemKey: randomUUID() }, client);
+  assert.equal(receipt.sourceCurrency, "EURC");
+  assert.equal(receipt.sourceAmount, 10_000_000); // 10 EURC in 6dp minor units
+
+  const forward = client.calls.find((c) => c.kind === "eur-beneficiary")!;
+  assert.equal(forward.iban, "DE89370400440532013000");
+  assert.equal(forward.country, "DEU", "alpha-2 payee_country mapped to Avenia's alpha-3");
+  assert.equal(forward.bankBeneficiaryName, "Fornecedor Exemplo LTDA");
+
+  await settleTicket("tkt_1");
+  assert.equal((await balancesForOrg(orgId)).EURC, 10_000_000, "EURC debited by the reserved amount");
 });
 
 test("USD/fedwire rides WIRE", async () => {

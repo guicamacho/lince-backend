@@ -5,10 +5,11 @@
  * (a payout ticket auto-executes once POSTed). Settle posts the 2-leg source-currency debit
  * in ticketApply.ts, currency-agnostic by construction.
  *
- * Rails (vendor surface verified 2026-07-15): pix = BRLA -> BRL PIX; ach/fedwire = USDT -> USD
- * ACH/WIRE (bank payee forwarded to Avenia's /usd/ endpoint); crypto = the payee's stablecoin
- * to their external wallet (address inline in the ticket, no registration). EUR/SEPA is
- * deferred until customers can hold EURC; swift/sepa payees are capture-only.
+ * Rails (vendor surface verified 2026-07-15..18): pix = BRLA -> BRL PIX; ach/fedwire = USDT ->
+ * USD ACH/WIRE (bank payee forwarded to Avenia's /usd/ endpoint); sepa = EURC -> EUR SEPA
+ * (payee forwarded to /eur/; EURC is the ONLY funding source Avenia allows for SEPA); crypto =
+ * the payee's stablecoin to their external wallet (address inline, no registration). swift
+ * payees are capture-only (Avenia has no SWIFT visibility).
  *
  * Money-out extras over Convert, gated BEFORE any reservation: the beneficiary must belong to
  * the org, be on a payable rail, and be active; and the 24h post-recovery hold (PRD-07 v5).
@@ -65,6 +66,19 @@ const PAYOUT_RAILS: Record<string, PayoutRailSpec> = {
   },
   ach: usdRail("ACH"),
   fedwire: usdRail("WIRE"),
+  sepa: {
+    sourceCurrency: () => "EURC", // the only SEPA funding source Avenia allows
+    destCurrency: () => "EUR",
+    phase2: async (client, subAccountId, input, beneficiary) => {
+      const aveniaBeneficiaryId = await ensureAveniaBeneficiary(input.orgId, beneficiary, subAccountId, client);
+      return client.createSepaPayout({
+        subAccountId,
+        inputAmount: input.amount,
+        beneficiaryEurBankAccountId: aveniaBeneficiaryId,
+        externalId: input.idemKey,
+      });
+    },
+  },
   crypto: {
     // Funded from the payee's own asset (USDT or USDC) — held balance in that coin required.
     sourceCurrency: (b) => (b.asset === "USDT" || b.asset === "USDC" ? b.asset : null),
@@ -143,7 +157,7 @@ export async function createPayout(
   const beneficiary = await getPayoutBeneficiary(orgId, input.beneficiaryId);
   if (!beneficiary) throw new HttpError("beneficiary_not_found", 404);
   const rail = PAYOUT_RAILS[beneficiary.rail ?? ""];
-  if (!rail) throw new HttpError("unsupported_rail", 422); // swift/sepa payees are capture-only
+  if (!rail) throw new HttpError("unsupported_rail", 422); // swift payees are capture-only
   const sourceCurrency = rail.sourceCurrency(beneficiary);
   if (!sourceCurrency || (beneficiary.rail === "crypto" && !AVENIA_CHAINS[beneficiary.network ?? ""])) {
     throw new HttpError("unsupported_rail", 422);

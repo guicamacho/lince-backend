@@ -16,11 +16,14 @@ import type { SwapRail, SubAccountCreator, AccountInfoReader } from "../provider
 
 export type ConvertClient = SwapRail & SubAccountCreator & AccountInfoReader;
 
-// Verified-live pairs (2026-07-12 probe). USD both ways. EUR (EURC) is a fast-follow — it needs
-// a round-trippable EURC<->BRLA pair + an EUR wallet card so a bought balance isn't stranded.
+// Verified-live pairs. USD both ways (probe 2026-07-12); EUR via EURC both ways (probe
+// 2026-07-18: BRLA->EURC and EURC->BRLA quote 200, pair EURCBRLA — round-trippable, so a
+// bought balance is never stranded).
 const CONVERT_PAIRS: ReadonlyArray<readonly [Currency, Currency]> = [
   ["BRLA", "USDT"],
   ["USDT", "BRLA"],
+  ["BRLA", "EURC"],
+  ["EURC", "BRLA"],
 ];
 function pairAllowed(from: string, to: string): from is Currency {
   return CONVERT_PAIRS.some(([f, t]) => f === from && t === to);

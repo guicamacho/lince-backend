@@ -18,9 +18,10 @@ export interface PayoutBeneficiary {
   rail: string | null;
   status: string;
   label: string;
-  asset: string | null; // dest_currency: BRL | USD | USDT | USDC | ...
+  asset: string | null; // dest_currency: BRL | USD | EUR | USDT | USDC | ...
   network: string | null; // crypto chain label, else null
   payee_legal_name: string | null;
+  payee_country: string | null; // ISO alpha-2 (SEPA: derived from the IBAN prefix at capture)
   destination: Record<string, string> | null;
   avenia_beneficiary_id: string | null;
 }
@@ -28,12 +29,21 @@ export interface PayoutBeneficiary {
 export async function getPayoutBeneficiary(orgId: string, beneficiaryId: string): Promise<PayoutBeneficiary | null> {
   const { rows } = await pool.query<PayoutBeneficiary>(
     `select id, rail, status, label, dest_currency as asset, network, payee_legal_name,
-            destination, avenia_beneficiary_id
+            payee_country, destination, avenia_beneficiary_id
        from avenia_beneficiaries where id = $1 and org_id = $2`,
     [beneficiaryId, orgId],
   );
   return rows[0] ?? null;
 }
+
+// Avenia's /eur/ registration wants ISO alpha-3; we store alpha-2 (IBAN prefix). SEPA zone only.
+const SEPA_ALPHA3: Record<string, string> = {
+  AD: "AND", AT: "AUT", BE: "BEL", BG: "BGR", CH: "CHE", CY: "CYP", CZ: "CZE", DE: "DEU",
+  DK: "DNK", EE: "EST", ES: "ESP", FI: "FIN", FR: "FRA", GB: "GBR", GR: "GRC", HR: "HRV",
+  HU: "HUN", IE: "IRL", IS: "ISL", IT: "ITA", LI: "LIE", LT: "LTU", LU: "LUX", LV: "LVA",
+  MC: "MCO", MT: "MLT", NL: "NLD", NO: "NOR", PL: "POL", PT: "PRT", RO: "ROU", SE: "SWE",
+  SI: "SVN", SK: "SVK", SM: "SMR", VA: "VAT",
+};
 
 /**
  * Lazily forward a bank-rail payee to Avenia on first use (the "forwarded later" seam from
@@ -78,8 +88,19 @@ export async function ensureAveniaBeneficiary(
         country: "USA", // ach/fedwire rails are US-fixed (rails.ts)
       },
     });
+  } else if (beneficiary.rail === "sepa") {
+    const country = SEPA_ALPHA3[beneficiary.payee_country ?? ""];
+    if (!d.iban || !country) throw new HttpError("beneficiary_incomplete", 422);
+    created = await client.createEurBeneficiary({
+      subAccountId,
+      alias: beneficiary.label,
+      iban: d.iban,
+      ...(d.bic ? { bic: d.bic } : {}),
+      country,
+      bankBeneficiaryName: beneficiary.payee_legal_name ?? beneficiary.label,
+    });
   } else {
-    throw new HttpError("unsupported_rail", 422); // crypto never registers; others aren't payable
+    throw new HttpError("unsupported_rail", 422); // crypto never registers; swift isn't payable
   }
   const upd = await pool.query(
     `update avenia_beneficiaries set avenia_beneficiary_id = $2

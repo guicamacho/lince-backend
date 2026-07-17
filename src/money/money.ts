@@ -2,7 +2,7 @@
  * Money is ALWAYS signed bigint minor units. Never floats, never Number for amounts.
  * Per-currency decimal places. (BRLA is held; "R$" is presentation-only — same 2 dp as BRL.)
  */
-export type Currency = "BRL" | "BRLA" | "USD" | "EUR" | "USDC" | "USDT";
+export type Currency = "BRL" | "BRLA" | "USD" | "EUR" | "USDC" | "USDT" | "EURC";
 
 const DECIMALS: Record<Currency, number> = {
   BRL: 2,
@@ -11,6 +11,7 @@ const DECIMALS: Record<Currency, number> = {
   EUR: 2,
   USDC: 6,
   USDT: 6,
+  EURC: 6, // Circle's euro coin — displayed as €, 6 dp like USDC
 };
 
 export function decimalsFor(currency: Currency): number {

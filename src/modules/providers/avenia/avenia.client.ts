@@ -94,6 +94,15 @@ export interface PayoutRail {
   createBrlBeneficiary(input: { subAccountId: string; alias: string; pixKey: string }): Promise<{ id: string }>;
   /** Register a USD beneficiary bank account (routing + account + address); returns Avenia's id. */
   createUsdBeneficiary(input: { subAccountId: string } & UsdBeneficiaryBody): Promise<{ id: string }>;
+  /** Register an EUR beneficiary bank account (IBAN, SEPA only — Avenia has no SWIFT visibility). */
+  createEurBeneficiary(input: {
+    subAccountId: string;
+    alias: string;
+    iban: string;
+    bic?: string;
+    country: string; // ISO alpha-3, e.g. "DEU"
+    bankBeneficiaryName: string;
+  }): Promise<{ id: string }>;
   createPixPayout(input: {
     subAccountId: string;
     inputCurrency: string; // held balance being paid out (BRLA today)
@@ -108,6 +117,13 @@ export interface PayoutRail {
     inputAmount: string;
     method: "ACH" | "WIRE";
     beneficiaryUsdBankAccountId: string; // Avenia-side beneficiary id (createUsdBeneficiary)
+    externalId?: string;
+  }): Promise<AveniaSwapResult>;
+  /** EUR payout over SEPA, funded from held EURC (the only SEPA funding source Avenia allows). */
+  createSepaPayout(input: {
+    subAccountId: string;
+    inputAmount: string; // EURC decimal string
+    beneficiaryEurBankAccountId: string;
     externalId?: string;
   }): Promise<AveniaSwapResult>;
   /** Stablecoin send to an external wallet — the address rides inline, no registration. */
@@ -435,6 +451,51 @@ export class AveniaClient implements SubAccountCreator, AccountInfoReader, Depos
       ticketOutput: input.method === "WIRE"
         ? { ticketUsdWireOutput: { beneficiaryUsdBankAccountId: input.beneficiaryUsdBankAccountId } }
         : { ticketUsdOutput: { beneficiaryUsdBankAccountId: input.beneficiaryUsdBankAccountId } },
+      externalId: input.externalId,
+    });
+    return { ticketId: ticket.id, quote };
+  }
+
+  /** Register an EUR beneficiary. Same TRAILING-SLASH collection path rule as /brl/ and /usd/. */
+  async createEurBeneficiary(input: {
+    subAccountId: string;
+    alias: string;
+    iban: string;
+    bic?: string;
+    country: string;
+    bankBeneficiaryName: string;
+  }): Promise<{ id: string }> {
+    const { subAccountId, ...bankBody } = input;
+    const uri = `/v2/account/beneficiaries/bank-accounts/eur/?subAccountId=${encodeURIComponent(subAccountId)}`;
+    const body = JSON.stringify(bankBody);
+    const res = await fetch(`${this.config.baseUrl}${uri}`, {
+      method: "POST",
+      headers: this.signedHeaders("POST", uri, body),
+      body,
+    });
+    if (!res.ok) throw new Error(`avenia eur beneficiary create ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const out = (await res.json()) as { id?: string };
+    if (!out.id) throw new Error("avenia eur beneficiary create: no id");
+    return { id: out.id };
+  }
+
+  async createSepaPayout(input: {
+    subAccountId: string;
+    inputAmount: string;
+    beneficiaryEurBankAccountId: string;
+    externalId?: string;
+  }): Promise<AveniaSwapResult> {
+    const { ticket, quote } = await this.quoteAndTicket({
+      subAccountId: input.subAccountId,
+      label: "payout",
+      quote: {
+        inputCurrency: "EURC",
+        inputPaymentMethod: "INTERNAL",
+        outputCurrency: "EUR",
+        outputPaymentMethod: "SEPA",
+        inputAmount: input.inputAmount,
+      },
+      ticketOutput: { ticketEurSepaOutput: { beneficiaryEurBankAccountId: input.beneficiaryEurBankAccountId } },
       externalId: input.externalId,
     });
     return { ticketId: ticket.id, quote };

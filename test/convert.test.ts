@@ -156,6 +156,18 @@ test("Phase-2 failure with NO ticket at Avenia is released by the reconciler (re
   assert.equal(ok.state, "funding");
 });
 
+test("EURC pair converts both ways (round trip verified live 2026-07-18)", async () => {
+  const orgId = await createOrg("active");
+  await seedBrla(orgId, 10_000n);
+  const out = await createConvert(orgId, null, { from: "BRLA", to: "EURC", amount: "50", idemKey: randomUUID() }, fakeClient());
+  assert.equal(out.state, "funding");
+  assert.equal(out.toCurrency, "EURC");
+  await seedBalance(orgId, "EURC", 5_000_000n); // 5 EURC — the return leg reserves against this
+  const back = await createConvert(orgId, null, { from: "EURC", to: "BRLA", amount: "3", idemKey: randomUUID() }, fakeClient());
+  assert.equal(back.state, "funding");
+  assert.equal(back.sourceAmount, 3_000_000); // 6dp minor units
+});
+
 test("unsupported pair is a 422 before any DB work", async () => {
   const orgId = await createOrg("active");
   await assert.rejects(
