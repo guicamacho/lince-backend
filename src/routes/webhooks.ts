@@ -62,8 +62,9 @@ export function registerWebhookRoutes(app: Express): void {
     await handleWebhook(req, res, "clerk");
   });
 
-  // Generic webhook intake — resend is Svix-verified; avenia/didit are stored-only (scheme
-  // unconfirmed) until processing lands. Delegated to the same inbox module. Never throttled.
+  // Generic webhook intake — every known provider is signature-verified in the inbox
+  // (resend Svix, avenia RSA-PSS, didit HMAC); unknown providers are rejected, nothing
+  // is stored unverified. Delegated to the same inbox module. Never throttled.
   app.post("/webhooks/:provider", rateLimit("webhook_exempt"), async (req: Request, res: Response) => {
     await handleWebhook(req, res, String(req.params.provider));
   });
