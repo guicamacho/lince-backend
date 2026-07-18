@@ -19,6 +19,7 @@ import { getOrgDetail } from "../modules/admin/orgDetail.js";
 import { getAdmissionAging } from "../modules/admin/aging.js";
 import { recordAuditExport } from "../modules/admin/auditExport.js";
 import { listAdmins, setAdminRoles } from "../modules/admin/staff.js";
+import { listSpreadConfig, setSpread } from "../modules/money/fxSpreads.js";
 import { enqueueApproval, listOpenApprovals, decideApproval, type ApprovalActionType } from "../modules/admin/approvals.js";
 import { createCase, listCases, getCaseDetail, assignCase, updateCaseStatus } from "../modules/cases/cases.service.js";
 import { postAdminCaseMessage } from "../modules/cases/messages.service.js";
@@ -101,6 +102,24 @@ export function registerAdminRoutes(app: Express): void {
       ),
     ]);
     res.json({ events: events.rows, notifications: notifications.rows });
+  });
+
+  // FX spread schedule (PRD-09): the commission schedule Avenia will apply as Markup Fee.
+  // Read for any admin; WRITES are superadmin-only and always audited (no silent rate changes).
+  app.get("/admin/fx-spreads", rateLimit("admin_export"), async (_req: Request, res: Response) => {
+    res.json({ spreads: await listSpreadConfig() });
+  });
+
+  app.put("/admin/fx-spreads", rateLimit("admin_export"), requireAdminRole("superadmin"), async (req: Request, res: Response) => {
+    const b = (req.body ?? {}) as { orgId?: unknown; pair?: unknown; direction?: unknown; spreadBps?: unknown };
+    await setSpread({
+      orgId: b.orgId ? String(b.orgId) : null,
+      pair: String(b.pair ?? ""),
+      direction: String(b.direction ?? ""),
+      spreadBps: b.spreadBps === null || b.spreadBps === undefined ? null : Number(b.spreadBps),
+      adminId: actingAdminId(res),
+    });
+    res.json({ ok: true });
   });
 
   // Treasury recon (PRD-04 §13.3 / AC12): latest runs + non-resolved breaks. Read-only;

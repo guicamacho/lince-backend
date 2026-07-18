@@ -21,6 +21,7 @@ import { createPayout } from "../modules/money/payout.js";
 import { listTransactionsForOrg } from "../modules/money/moneyLoop.js";
 import { balancesForOrg, balanceHistoryForOrg } from "../modules/ledger/ledger.service.js";
 import { getRates, type RateQuoteFn } from "../modules/money/rates.service.js";
+import { getEffectiveSpreads, applySpreads } from "../modules/money/fxSpreads.js";
 import { aveniaFromEnv } from "../modules/providers/avenia/avenia.client.js";
 import { listBeneficiariesForOrg, createBeneficiaryForOrg } from "../modules/beneficiaries/beneficiaries.service.js";
 import { listMembers, inviteMember, resendInvitation, changeMemberRole, removeMember, transferOwnership } from "../modules/team/team.service.js";
@@ -170,7 +171,14 @@ export function registerCustomerRoutes(app: Express): void {
       sub && client
         ? (i) => client.quoteRate({ subAccountId: sub, inputCurrency: i.inputCurrency, outputCurrency: i.outputCurrency })
         : async () => null;
-    res.json(await getRates(sub ?? "none", quote));
+    const base = await getRates(sub ?? "none", quote);
+    // PRD-09 phase 3: base stays market-wide cached; the org's schedule applies per request.
+    // Flag OFF until the §2 gates clear (the board must always match execution).
+    if (env.fxSpreads.displayEnabled) {
+      res.json(applySpreads(base, await getEffectiveSpreads(res.locals.orgId)));
+      return;
+    }
+    res.json(base);
   });
 
   // Beneficiaries — travel-rule capture (AUSTRAC §4 / 255033346). The customer captures payee

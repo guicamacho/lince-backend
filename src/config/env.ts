@@ -93,6 +93,11 @@ export const env = {
   // Shared secret for server-to-server /admin/* calls from the admin app (which
   // authenticates staff via its own, separate Clerk instance).
   adminServiceToken: optional("ADMIN_SERVICE_TOKEN"),
+  // PRD-09: apply the fx spread schedule to the DISPLAY board. OFF until the §2 gates
+  // (counsel + Avenia markup config) clear — shown rate must equal transacted rate.
+  fxSpreads: {
+    displayEnabled: process.env.FX_SPREADS_DISPLAY === "true",
+  },
   // Admission SLA threshold (days) for the aging instrument (PRD-04 §4.3). Wall-clock
   // per canon (business-day math is reserved for IFTI/SMR). Default 2.
   sla: {
