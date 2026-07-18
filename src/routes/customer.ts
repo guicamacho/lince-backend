@@ -212,12 +212,20 @@ export function registerCustomerRoutes(app: Express): void {
     res.json({ resent: true });
   });
 
-  app.post("/app/team/members/:personId/role", rateLimit("beneficiary_write"), requirePermission("manage_roles"), async (req: Request, res: Response) => {
-    const role = String((req.body as { role?: unknown } | null)?.role ?? "");
-    res.json({
-      roles: await changeMemberRole(res.locals.orgId, res.locals.personId, String(req.params.personId), role),
-    });
-  });
+  // Role changes are in PRD-07's sensitive list: same step-up + 2FA stack as transfer (Cluster 2).
+  app.post(
+    "/app/team/members/:personId/role",
+    rateLimit("beneficiary_write"),
+    requirePermission("manage_roles"),
+    requireStepUp(env.stepUp.enforced),
+    requireMfaEnrolled(),
+    async (req: Request, res: Response) => {
+      const role = String((req.body as { role?: unknown } | null)?.role ?? "");
+      res.json({
+        roles: await changeMemberRole(res.locals.orgId, res.locals.personId, String(req.params.personId), role),
+      });
+    },
+  );
 
   app.delete("/app/team/members/:personId", rateLimit("beneficiary_write"), requirePermission("manage_team"), async (req: Request, res: Response) => {
     await removeMember(res.locals.orgId, res.locals.personId, String(req.params.personId), revokeInvitationsFor);

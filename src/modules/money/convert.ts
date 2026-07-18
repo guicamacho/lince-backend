@@ -5,8 +5,8 @@
  * per-org money lock, Avenia call with no lock held, leave-'created' on a lost response.
  * Settle posts the 4-leg ledger entry in ticketApply.ts.
  *
- * ponytail: the under-lock active re-check (B14) rides on the /app gate's active-membership
- * check today; wire an explicit access_status re-check when that column/framework lands.
+ * Money-out gates (post-recovery hold, Phase-2 access_status re-check) are centralized in
+ * runMoneyLoop since Cluster 2 — nothing to add per-caller here.
  */
 import { createHash } from "node:crypto";
 import { HttpError } from "../../http/error.js";

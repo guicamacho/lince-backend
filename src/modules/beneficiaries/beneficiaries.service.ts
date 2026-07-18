@@ -8,6 +8,7 @@
  */
 import { pool, withTransaction } from "../../db/pool.js";
 import { enqueueNotification } from "../notifications/outbox.js";
+import { moneyOutHoldActive } from "../access/recoveryHold.js";
 import { validateBeneficiary } from "./rails.js";
 import { HttpError } from "../../http/error.js";
 import type { PayoutRail } from "../providers/avenia/avenia.client.js";
@@ -139,6 +140,9 @@ export async function createBeneficiaryForOrg(
   body: Record<string, unknown>,
 ): Promise<{ id: string }> {
   const v = validateBeneficiary(body); // throws HttpError on any invalid/missing rail field
+  // Post-recovery hold (Cluster 2): a new payee is the takeover attacker's first move —
+  // during the 24h window, adding destinations is blocked along with money-out.
+  if (await moneyOutHoldActive(orgId)) throw new HttpError("money_out_held", 403);
   return withTransaction(async (client) => {
     // The authorising individual (org_people) — supports the SMR "who completed it" field.
     const { rows: ap } = await client.query<{ id: string }>(

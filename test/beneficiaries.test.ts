@@ -6,6 +6,7 @@ import { bootstrapOrgForClerkUser } from "../src/modules/onboarding/bootstrap.js
 import { listBeneficiariesForOrg, createBeneficiaryForOrg } from "../src/modules/beneficiaries/beneficiaries.service.js";
 import { validateBeneficiary } from "../src/modules/beneficiaries/rails.js";
 import { resetDb, createOrg } from "./helpers.js";
+import { registerPostRecoveryHold } from "../src/modules/access/recoveryHold.js";
 import { HttpError } from "../src/http/error.js";
 
 beforeEach(resetDb);
@@ -129,4 +130,12 @@ test("list is org-scoped, newest-first, and surfaces rail/asset/hint (no raw ide
   assert.equal(rows[0].rail, "pix");
   assert.equal(rows[0].asset, "BRL");
   assert.ok(!("destination" in rows[0]), "list must not return the raw destination identifier");
+});
+
+// Cluster 2: during the 24h post-recovery hold, adding a payee is blocked (the takeover
+// attacker's first move is a new destination).
+test("post-recovery hold blocks beneficiary creation", async () => {
+  const orgId = await createOrg("active");
+  await registerPostRecoveryHold(orgId, 24);
+  await assert.rejects(createBeneficiaryForOrg(orgId, null, achBody()), /money_out_held/);
 });

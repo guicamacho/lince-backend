@@ -17,7 +17,6 @@
 import { createHash } from "node:crypto";
 import { HttpError } from "../../http/error.js";
 import { parseCustomerAmount, type Currency } from "../../money/money.js";
-import { moneyOutHoldActive } from "../access/recoveryHold.js";
 import { getPayoutBeneficiary, ensureAveniaBeneficiary, type PayoutBeneficiary } from "../beneficiaries/beneficiaries.service.js";
 import { mapVendorFees, runMoneyLoop, type MappedFee, type MoneyTxRow } from "./moneyLoop.js";
 import type { PayoutRail, SubAccountCreator, AveniaSwapResult } from "../providers/avenia/avenia.client.js";
@@ -164,7 +163,7 @@ export async function createPayout(
   }
   if (beneficiary.status !== "active") throw new HttpError("beneficiary_disabled", 422);
   rail.gate?.(beneficiary);
-  if (await moneyOutHoldActive(orgId)) throw new HttpError("money_out_held", 403);
+  // Post-recovery hold + access re-check live in runMoneyLoop (Cluster 2) — not repeated here.
 
   const amountMinor = parseCustomerAmount(input.amount, sourceCurrency);
   if (amountMinor === null) throw new HttpError("invalid_amount", 422);

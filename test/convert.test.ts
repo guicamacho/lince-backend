@@ -6,6 +6,7 @@ import { pool } from "../src/db/pool.js";
 import { createConvert, type ConvertClient } from "../src/modules/money/convert.js";
 import { reconcileInFlightTickets } from "../src/modules/money/moneyLoop.js";
 import { balancesForOrg } from "../src/modules/ledger/ledger.service.js";
+import { registerPostRecoveryHold } from "../src/modules/access/recoveryHold.js";
 import { resetDb, createOrg, seedBalance, settleTicket } from "./helpers.js";
 
 beforeEach(resetDb);
@@ -174,4 +175,49 @@ test("unsupported pair is a 422 before any DB work", async () => {
     createConvert(orgId, null, { from: "BRLA", to: "BRL", amount: "50", idemKey: randomUUID() }, fakeClient()),
     /unsupported_pair/,
   );
+});
+
+// --- Cluster 2: the money-out gates live in the SHARED loop, so Convert gets them too ---
+
+test("post-recovery hold blocks NEW converts (gate centralized in runMoneyLoop)", async () => {
+  const orgId = await createOrg("active");
+  await seedBrla(orgId, 10_000n);
+  await registerPostRecoveryHold(orgId, 24);
+  const client = fakeClient();
+  await assert.rejects(
+    createConvert(orgId, null, { from: "BRLA", to: "USDT", amount: "50", idemKey: randomUUID() }, client),
+    /money_out_held/,
+  );
+  assert.equal(client.tickets, 0);
+  const rows = await pool.query("select count(*)::int as n from org_transactions where org_id = $1", [orgId]);
+  assert.equal(rows.rows[0]!.n, 0, "reservation rolled back");
+});
+
+test("replay of an already-executed convert returns its receipt even under a hold", async () => {
+  const orgId = await createOrg("active");
+  await seedBrla(orgId, 10_000n);
+  const client = fakeClient();
+  const idemKey = randomUUID();
+  const a = await createConvert(orgId, null, { from: "BRLA", to: "USDT", amount: "50", idemKey }, client);
+  await registerPostRecoveryHold(orgId, 24);
+  const b = await createConvert(orgId, null, { from: "BRLA", to: "USDT", amount: "50", idemKey }, client);
+  assert.equal(b.id, a.id, "idempotent read survives the hold");
+  assert.equal(client.tickets, 1, "no second vendor call");
+});
+
+test("Phase-2 access re-check: a suspend after the route gate fails the row before any vendor call", async () => {
+  const orgId = await createOrg("active");
+  await seedBrla(orgId, 10_000n);
+  await pool.query("update orgs set access_status = 'suspended' where id = $1", [orgId]);
+  const client = fakeClient();
+  await assert.rejects(
+    createConvert(orgId, null, { from: "BRLA", to: "USDT", amount: "50", idemKey: randomUUID() }, client),
+    /org_access_restricted/,
+  );
+  assert.equal(client.tickets, 0, "vendor never called");
+  const row = await pool.query<{ state: string; error: { stage?: string } }>(
+    "select state, error from org_transactions where org_id = $1", [orgId],
+  );
+  assert.equal(row.rows[0]!.state, "failed", "reservation released via failed (safe: no ticket exists)");
+  assert.equal(row.rows[0]!.error.stage, "access_recheck");
 });

@@ -8,6 +8,7 @@ import { pool, withTransaction } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
 import { vendorMinor, type Currency } from "../../money/money.js";
 import { acquireOrgMoneyLock } from "../../db/lockKeys.js";
+import { moneyOutHoldActive } from "../access/recoveryHold.js";
 import { ensureAveniaSubaccount } from "../onboarding/aveniaProvisioning.js";
 import { applyTicketStatus, APPLY_ROW_COLUMNS, type ApplyRow } from "./ticketApply.js";
 import type { TicketReader, SubAccountCreator, AveniaSwapResult } from "../providers/avenia/avenia.client.js";
@@ -39,6 +40,16 @@ const TX_COLUMNS = "id, state, payload_hash, beneficiary_id, source_currency, so
  *     row stays 'created' — a ticket auto-executes the instant it is POSTed, so marking 'failed'
  *     on a lost response would strand executed money (the reconciler skips 'failed' and the PAID
  *     webhook can't match a null vendor_ref). reconcileInFlightTickets settles or releases it.
+ *
+ * MONEY-OUT GATES live here too (Cluster 2) so no caller can forget one:
+ *   - the 24h post-recovery hold blocks NEW reservations (403 money_out_held); replays of an
+ *     already-claimed intent still return their receipt — the money may already have moved,
+ *     and idempotent reads must never fail;
+ *   - a Phase-2 pre-flight re-checks orgs.access_status right before the vendor call: an
+ *     admin suspend/block landing between the route gate and Phase 2 must not send money.
+ *     No vendor call has happened at that point, so failing the row is SAFE (it releases
+ *     the reservation; the leave-'created' rule applies only once the call is attempted);
+ *   - the future limits/velocity check (PRD-04 §13.2) slots in next to the hold check.
  *
  * Settle stays in ticketApply.ts. Deposits do NOT ride this loop on purpose: a PIX-in charge
  * takes no lock, reserves nothing, and safely marks 'failed' on error.
@@ -75,7 +86,9 @@ export async function runMoneyLoop<R>(args: {
        args.sourceCurrency, args.sourceAmount, args.destCurrency, args.idemKey, args.hash],
     );
     if (!claim.rowCount) {
-      // Replay: return the existing reservation, no new hold, no balance re-check.
+      // Replay: return the existing reservation, no new hold, no balance re-check —
+      // and no money-out gates: the intent may already have executed, and an
+      // idempotent read must never fail because a hold started afterwards.
       const { rows } = await c.query<MoneyTxRow>(
         `select ${TX_COLUMNS} from org_transactions where org_id = $1 and idem_key = $2`,
         [args.orgId, args.idemKey],
@@ -85,6 +98,9 @@ export async function runMoneyLoop<R>(args: {
       if (existing.payload_hash !== args.hash) throw new HttpError("idem_key_payload_mismatch", 409);
       return { replay: true as const, row: existing };
     }
+    // Post-recovery hold (PRD-07 §3.5): NEW money-out is blocked for 24h after an
+    // account recovery. Checked on the tx client; the throw rolls the reservation back.
+    if (await moneyOutHoldActive(args.orgId, new Date(), c)) throw new HttpError("money_out_held", 403);
     // Settled(src) - Σ(in-flight outbound reservations in src), including the row just inserted,
     // in ONE snapshot. < 0 means this reservation overcommits -> throw rolls it back.
     const { rows } = await c.query<{ available: string }>(
@@ -102,6 +118,22 @@ export async function runMoneyLoop<R>(args: {
   });
   if (reservation.replay) return args.receipt(reservation.row);
   const txId = reservation.txId;
+
+  // PHASE 2 pre-flight — access_status re-check (PRD-07 §2): an admin suspend/block that
+  // landed after the route gate must stop here. Safe to fail the row: no vendor call yet,
+  // so nothing can have executed, and 'failed' releases the reservation.
+  const access = await pool.query<{ access_status: string }>(
+    `select access_status from orgs where id = $1`,
+    [args.orgId],
+  );
+  if (access.rows[0]?.access_status !== "active") {
+    await pool.query(
+      `update org_transactions set state = 'failed', error = $2, updated_at = now()
+        where id = $1 and state = 'created'`,
+      [txId, JSON.stringify({ stage: "access_recheck", accessStatus: access.rows[0]?.access_status ?? "missing" })],
+    );
+    throw new HttpError("org_access_restricted", 403);
+  }
 
   // PHASE 2 — no lock held: subaccount, then the rail's Avenia call.
   let result;
