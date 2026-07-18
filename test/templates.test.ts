@@ -49,3 +49,27 @@ test("renderTemplate fills {{var}} from payload; missing var renders empty", () 
   const blank = renderTemplate("beneficiary_added", {});
   assert.doesNotMatch(blank.body, /\{\{/);
 });
+
+// PRD-14 §3 — the branded HTML layer.
+const BASE = "https://app.test.lince";
+
+test("html part renders for customer templates when appBaseUrl is set; not otherwise", () => {
+  assert.ok(renderTemplate("beneficiary_added", { label: "X" }, BASE).html);
+  assert.equal(renderTemplate("beneficiary_added", { label: "X" }).html, undefined);
+  // admin (Slack) templates never get the email layout
+  assert.equal(renderTemplate("admin_alert", { title: "t", detail: "d" }, BASE).html, undefined);
+});
+
+test("html escapes payload content — a variable can never become markup", () => {
+  const r = renderTemplate("beneficiary_added", { label: '<img src=x onerror=alert(1)>' }, BASE);
+  assert.doesNotMatch(r.html!, /<img src=x/);
+  assert.match(r.html!, /&lt;img src=x/);
+});
+
+test("html adds chrome, never words: the reviewed text appears verbatim; CTA renders from the registry", () => {
+  const r = renderTemplate("activation_approved", {}, BASE);
+  assert.match(r.html!, new RegExp(r.body.slice(0, 40))); // filled text present as-is
+  assert.match(r.html!, /Fazer meu primeiro depósito/);
+  assert.match(r.html!, new RegExp(`${BASE}/app/deposit`));
+  assert.match(r.html!, new RegExp(`${BASE}/email/lince-mark\\.png`));
+});

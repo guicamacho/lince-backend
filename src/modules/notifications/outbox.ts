@@ -148,7 +148,7 @@ async function processRow(client: pg.PoolClient, cfg: NotifyConfig, select: Sele
     to = email;
   }
 
-  const rendered = renderTemplate(row.template_id as TemplateId, row.payload);
+  const rendered = renderTemplate(row.template_id as TemplateId, row.payload, cfg.appBaseUrl);
   const adapter = select(template.recipientClass, cfg);
   let result;
   try {

@@ -17,7 +17,7 @@ import { ensureAccount, postBalancedTransactionOn } from "../ledger/ledger.servi
 import { DuplicateLedgerPostError } from "../ledger/ledger.types.js";
 import { enqueueNotification } from "../notifications/outbox.js";
 import type { TicketState } from "../providers/provider.types.js";
-import { fromMinor, type Currency } from "../../money/money.js";
+import { fromMinor, vendorMinor, type Currency } from "../../money/money.js";
 
 /** Avenia ticket status -> Lince org_transactions.state (deposit lifecycle). */
 export const TICKET_TO_TX_STATE: Record<string, string> = {
@@ -38,10 +38,12 @@ export interface ApplyRow {
   source_amount: string | null; // bigint comes back as string from pg
   dest_currency: string | null;
   dest_amount: string | null;
-  quote: { ticketStatus?: string } | null;
+  quote: { ticketStatus?: string; appliedFees?: unknown } | null;
+  created_at: Date | string;
 }
 
-export const APPLY_ROW_COLUMNS = "id, org_id, type, source_currency, source_amount, dest_currency, dest_amount, quote";
+export const APPLY_ROW_COLUMNS =
+  "id, org_id, type, source_currency, source_amount, dest_currency, dest_amount, quote, created_at";
 
 /** Apply a wire-format ticket status to a locked org_transactions row. Returns what happened. */
 export async function applyTicketStatus(
@@ -159,7 +161,7 @@ export async function applyTicketStatus(
       eventType: "ticket_settled",
       recipientRef: tx.org_id,
       templateId: "ticket_paid",
-      payload: { summary: paidSummary(tx) },
+      payload: { summary: paidSummary(tx), receipt: paidReceipt(tx) },
     });
   } else if (nextState === "failed") {
     await enqueueNotification(client, {
@@ -189,4 +191,66 @@ function paidSummary(tx: ApplyRow): string {
     return `Pagamento de ${sent} enviado.`;
   }
   return "Sua transação foi concluída.";
+}
+
+/** "4min32s" / "1h4min" / "45s" — settlement time from ticket creation to PAID. */
+function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}min${s % 60 ? `${s % 60}s` : ""}`;
+  return `${Math.floor(m / 60)}h${m % 60 ? `${m % 60}min` : ""}`;
+}
+
+/** pt-BR "as vendor quotes it" fee labels — unknown types fall back to the raw label. */
+const FEE_LABELS: Record<string, string> = {
+  "Markup Fee": "Serviço",
+  "In Fee": "Entrada",
+  "Out Fee": "Saída",
+  "Crypto Fee": "Rede",
+  "Gas Fee": "Rede",
+};
+
+/**
+ * PRD-14 §5A ticket_paid v2 receipt: proof metrics from stored actuals — settlement time,
+ * itemized vendor fees (no-spread presentation), effective FX rate when the legs are in
+ * different display currencies. Returns "" or a paragraph ending in a blank line, so the
+ * template renders clean either way. ponytail: rate is the all-in actual (dest/source);
+ * the vs-market-mid comparison waits until mid-at-execution is stored on the row.
+ */
+function paidReceipt(tx: ApplyRow): string {
+  const lines: string[] = [];
+  const created = new Date(tx.created_at).getTime();
+  if (Number.isFinite(created)) lines.push(`Liquidado em ${formatDuration(Date.now() - created)}.`);
+
+  const rawFees = Array.isArray(tx.quote?.appliedFees) ? tx.quote.appliedFees : [];
+  const fees = rawFees
+    .filter((f): f is { type?: unknown; amount?: unknown; currency?: unknown } => typeof f === "object" && f !== null)
+    .map((f) => {
+      const ccy = String(f.currency ?? "BRL");
+      const minor = vendorMinor(String(f.amount ?? ""), ccy as Currency);
+      return { label: FEE_LABELS[String(f.type ?? "")] ?? String(f.type ?? "taxa"), minor, ccy };
+    })
+    .filter((f) => f.minor > 0n);
+  if (fees.length) {
+    lines.push(`Taxas: ${fees.map((f) => `${display(f.minor.toString(), f.ccy)} (${f.label})`).join(", ")}.`);
+  }
+
+  // Effective rate only when the legs display as different currencies (FX, not a transfer).
+  if (
+    tx.source_amount && tx.source_currency && tx.dest_amount && tx.dest_currency &&
+    SYMBOL[tx.source_currency] !== SYMBOL[tx.dest_currency]
+  ) {
+    const srcMajor = Number(fromMinor(BigInt(tx.source_amount), tx.source_currency as Currency));
+    const destMajor = Number(fromMinor(BigInt(tx.dest_amount), tx.dest_currency as Currency));
+    // Present as R$ per 1 unit of the foreign leg — the direction customers quote.
+    const brlIsSource = SYMBOL[tx.source_currency] === "R$";
+    const rate = brlIsSource ? srcMajor / destMajor : destMajor / srcMajor;
+    const foreign = brlIsSource ? tx.dest_currency : tx.source_currency;
+    if (Number.isFinite(rate) && rate > 0 && (SYMBOL[tx.source_currency] === "R$" || SYMBOL[tx.dest_currency] === "R$")) {
+      lines.push(`Câmbio efetivo: R$ ${rate.toFixed(4).replace(".", ",")} por ${SYMBOL[foreign] ?? foreign} 1,00.`);
+    }
+  }
+
+  return lines.length ? lines.join(" ") + "\n\n" : "";
 }

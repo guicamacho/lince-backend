@@ -139,6 +139,8 @@ test("payout settle enqueues ONE ticket_paid with a pt-BR summary; replayed stat
   const { rows } = await rowsFor("event_type = 'ticket_settled' and recipient_ref = $1", [orgId]);
   assert.equal(rows.length, 1);
   assert.equal(rows[0]!.payload.summary, "Pagamento de R$ 9,80 enviado.");
+  // v2 receipt (PRD-14): settlement time always derivable from created_at
+  assert.match((rows[0]!.payload as { receipt?: string }).receipt ?? "", /Liquidado em /);
 });
 
 test("failed ticket enqueues the neutral ticket_failed (no reason anywhere)", async () => {

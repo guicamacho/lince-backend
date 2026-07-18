@@ -50,6 +50,9 @@ export const env = {
     from: optional("NOTIFY_FROM"),
     replyTo: optional("NOTIFY_REPLY_TO"),
     slackWebhookUrl: optional("NOTIFY_SLACK_WEBHOOK_URL"),
+    // Customer app base URL: CTA links + the hosted logo in branded emails (PRD-14 §3).
+    // Unset = emails go out text-only (the reviewed artifact; branding is additive).
+    appBaseUrl: optional("NOTIFY_APP_BASE_URL"),
   },
   // MFA policy (B15). Ruling (PRD-07 v5): optional by default (config-only flip to
   // mandatory), no SMS, 24h post-recovery money-out hold (hours passed to recoveryHold.ts

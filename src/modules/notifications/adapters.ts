@@ -11,7 +11,8 @@ import type { RecipientClass } from "./templates.js";
 
 export interface Rendered {
   subject: string;
-  body: string;
+  body: string; // the reviewed plain text — always present, always sent
+  html?: string; // branded layout wrapping the same text (PRD-14 §3); email sends only
 }
 
 export type SendResult = { ok: true; providerRef: string } | { ok: false; error: string };
@@ -28,6 +29,8 @@ export interface NotifyConfig {
   from?: string;
   replyTo?: string;
   slackWebhookUrl?: string;
+  /** Customer app base URL — CTA links + the hosted logo. Unset = text-only emails. */
+  appBaseUrl?: string;
 }
 
 /** Default adapter — logs and succeeds. Dev/sandbox, and the fallback whenever a live
@@ -56,6 +59,7 @@ export class ResendAdapter implements SendAdapter {
           to: recipientRef,
           subject: rendered.subject,
           text: rendered.body,
+          ...(rendered.html ? { html: rendered.html } : {}),
           ...(this.cfg.replyTo ? { reply_to: this.cfg.replyTo } : {}),
         }),
       });

@@ -15,6 +15,8 @@
  * third-party payee. No payee template, no suppression list, no migration 0008 now.
  */
 
+import { renderEmailHtml, type EmailCta } from "./emailHtml.js";
+
 export type RecipientClass = "customer" | "admin" | "payee";
 
 export interface Template {
@@ -24,6 +26,8 @@ export interface Template {
   body: string; // {{var}} placeholders filled from the outbox row payload
   tipping_off_reviewed: boolean;
   recipientClass: RecipientClass;
+  /** At most one button (PRD-14 §3). Label+path are part of the reviewed artifact. */
+  cta?: EmailCta;
 }
 
 /**
@@ -37,14 +41,15 @@ export interface Template {
  * DO say what happened: the whole point is that the legitimate owner notices.
  */
 export const TEMPLATES = {
-  // LIVE — recordAveniaVerdict(approved). Safe copy, reviewed.
+  // LIVE — recordAveniaVerdict(approved). Safe copy, reviewed. v2: first-deposit CTA (PRD-14 §5B).
   activation_approved: {
-    version: 1,
+    version: 2,
     locale: "pt-BR",
     subject: "Sua conta Lince está ativa",
     body: "Olá! Sua empresa foi aprovada e sua conta Lince já está ativa. Você já pode começar a operar.",
     tipping_off_reviewed: true,
     recipientClass: "customer",
+    cta: { label: "Fazer meu primeiro depósito", path: "/app/deposit" },
   },
   // LIVE — recordAveniaVerdict(rejected). NEUTRAL copy: never names a reason or suspicion.
   application_rejected: {
@@ -83,11 +88,13 @@ export const TEMPLATES = {
     recipientClass: "customer",
   },
   // LIVE — applyTicketStatus on settle. Payload carries a pre-built pt-BR summary line.
+  // v2 receipt (PRD-14 phase 1): {{receipt}} = settlement time + itemized vendor fees +
+  // effective FX rate, built from ticket actuals at the settle site; empty renders clean.
   ticket_paid: {
-    version: 1,
+    version: 2,
     locale: "pt-BR",
     subject: "Transação concluída",
-    body: "{{summary}} Você pode ver os detalhes na sua conta Lince.",
+    body: "{{summary}}\n\n{{receipt}}Você pode ver os detalhes na sua conta Lince.",
     tipping_off_reviewed: true,
     recipientClass: "customer",
   },
@@ -154,9 +161,24 @@ export function isSendable(t: Template): boolean {
   return t.recipientClass === "admin" || t.tipping_off_reviewed === true;
 }
 
-/** Fill {{var}} placeholders from payload; a missing var renders empty. Pure. */
-export function renderTemplate(id: TemplateId, payload: Record<string, unknown>): { subject: string; body: string } {
-  const t = TEMPLATES[id];
+/**
+ * Fill {{var}} placeholders from payload; a missing var renders empty. Pure.
+ * With `appBaseUrl` set, customer/payee templates also get the branded HTML part
+ * (PRD-14 §3) — the layout wraps the SAME filled text; it never adds words. Admin
+ * (Slack) templates and unconfigured environments stay text-only.
+ */
+export function renderTemplate(
+  id: TemplateId,
+  payload: Record<string, unknown>,
+  appBaseUrl?: string,
+): { subject: string; body: string; html?: string } {
+  const t: Template = TEMPLATES[id]; // widen: cta is optional and absent on most literals
   const fill = (s: string) => s.replace(/\{\{(\w+)\}\}/g, (_, k) => String(payload[k] ?? ""));
-  return { subject: fill(t.subject), body: fill(t.body) };
+  const subject = fill(t.subject);
+  const body = fill(t.body);
+  const html =
+    appBaseUrl && t.recipientClass !== "admin"
+      ? renderEmailHtml({ subject, text: body, appBaseUrl, cta: t.cta })
+      : undefined;
+  return { subject, body, html };
 }

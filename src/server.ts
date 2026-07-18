@@ -24,6 +24,7 @@ export function startServer(app: Express): void {
     from: env.notify.from,
     replyTo: env.notify.replyTo,
     slackWebhookUrl: env.notify.slackWebhookUrl,
+    appBaseUrl: env.notify.appBaseUrl,
   };
   // Single-flight: skip a tick if the previous one is still running, so a slow DB can't
   // pile up overlapping drains and exhaust the connection pool.
