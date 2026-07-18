@@ -24,6 +24,11 @@ export interface AccountInfoReader {
   getAccountInfo(subAccountId?: string): Promise<AveniaAccountInfo>;
 }
 
+/** Read-only per-subaccount balance map (currency -> decimal string). Recon consumes this. */
+export interface BalanceReader {
+  getBalances(subAccountId?: string): Promise<Record<string, string>>;
+}
+
 /** Raw quote fields the deposit flow snapshots (amounts stay decimal STRINGS off the wire;
  *  the money module converts to bigint minor units at the edge). */
 export interface AveniaDepositResult {
@@ -154,7 +159,7 @@ export interface TicketReader {
 /** Nil-UUID beneficiaryWalletId = "credit this subaccount's own wallet". */
 const OWN_WALLET = { beneficiaryWalletId: "00000000-0000-0000-0000-000000000000" };
 
-export class AveniaClient implements SubAccountCreator, AccountInfoReader, DepositRail, SwapRail, PayoutRail, TicketReader {
+export class AveniaClient implements SubAccountCreator, AccountInfoReader, BalanceReader, DepositRail, SwapRail, PayoutRail, TicketReader {
   constructor(private readonly config: AveniaConfig) {}
 
   /** One ticket's current status — the reconciler's poll (subAccountId must match the
@@ -208,6 +213,18 @@ export class AveniaClient implements SubAccountCreator, AccountInfoReader, Depos
     });
     if (!res.ok) throw new Error(`avenia account-info ${res.status}: ${(await res.text()).slice(0, 200)}`);
     return (await res.json()) as AveniaAccountInfo;
+  }
+
+  /** Balances for the MAIN account or a subaccount. Response: { balances: { BRLA: "10.5", ... } }
+   *  (keys observed live: ARSA BRLA EURC USDC USDM USDT — scripts/avenia/cli.ts probe). */
+  async getBalances(subAccountId?: string): Promise<Record<string, string>> {
+    const requestUri = `/v2/account/balances${subAccountId ? `?subAccountId=${encodeURIComponent(subAccountId)}` : ""}`;
+    const res = await fetch(`${this.config.baseUrl}${requestUri}`, {
+      headers: this.signedHeaders("GET", requestUri),
+    });
+    if (!res.ok) throw new Error(`avenia balances ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const json = (await res.json()) as { balances?: Record<string, string> };
+    return json.balances ?? (json as unknown as Record<string, string>);
   }
 
   /** COMPANY subaccount on the MAIN account (Connectivity §1/§3) — one per customer org.

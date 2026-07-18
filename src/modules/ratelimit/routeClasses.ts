@@ -94,6 +94,7 @@ export const ROUTE_CLASSMAP: Record<string, RouteClass> = {
   "GET /admin/orgs/:id/documents": "admin_export",
   "GET /admin/transactions": "admin_export",
   "GET /admin/webhooks": "admin_export",
+  "GET /admin/recon": "admin_export",
   "POST /admin/webhooks/:id/replay": "admin_export",
   "GET /admin/orgs/:id": "admin_export",
   "POST /admin/orgs/:id/verdict": "admin_export",

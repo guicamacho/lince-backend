@@ -11,6 +11,7 @@ import { reconcileInFlightTickets } from "./modules/money/moneyLoop.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { alertSlaBreachesOnce } from "./modules/admin/aging.js";
 import { runLifecycleSweep } from "./modules/lifecycle/closure.service.js";
+import { runReconOnce } from "./modules/ledger/recon.js";
 
 const DRAIN_INTERVAL_MS = Number(process.env.DRAIN_INTERVAL_MS ?? 5000);
 
@@ -49,6 +50,7 @@ export function startServer(app: Express): void {
         if (tick === 1 || tick % 720 === 0) {
           await alertSlaBreachesOnce(env.sla.admissionDays);
           await runLifecycleSweep(); // stale warnings/expiry, dormancy, retention, rate_limits GC
+          if (avenia) await runReconOnce(avenia); // ledger-vs-Avenia comparator (Cluster 4)
         }
       } catch (err) {
         console.warn("drain.tick_failed", err instanceof Error ? err.message : String(err));

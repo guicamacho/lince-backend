@@ -103,6 +103,27 @@ export function registerAdminRoutes(app: Express): void {
     res.json({ events: events.rows, notifications: notifications.rows });
   });
 
+  // Treasury recon (PRD-04 §13.3 / AC12): latest runs + non-resolved breaks. Read-only;
+  // resolution flows through the linked recon_break case for now.
+  app.get("/admin/recon", rateLimit("admin_export"), async (_req: Request, res: Response) => {
+    const [runs, breaks] = await Promise.all([
+      pool.query(
+        `select id, started_at, finished_at, status, summary from recon_runs order by started_at desc limit 20`,
+      ),
+      pool.query(
+        `select b.id, b.run_id, b.subaccount_id, b.asset, b.break_type, b.expected_minor, b.actual_minor,
+                b.status, b.detected_at, b.case_id, o.razao_social
+           from recon_breaks b
+           left join cases cs on cs.id = b.case_id
+           left join orgs o on o.id = cs.org_id
+          where b.status <> 'resolved'
+          order by b.detected_at desc
+          limit 100`,
+      ),
+    ]);
+    res.json({ runs: runs.rows, breaks: breaks.rows });
+  });
+
   // Replay a failed/dead event back through the drain (idempotent handlers make it safe).
   // Order matters: resolve the actor FIRST, then reset + audit in ONE transaction — a replay
   // re-fires a money-path handler and must never commit without its compliance trail.
