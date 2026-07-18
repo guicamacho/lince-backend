@@ -10,6 +10,7 @@ import { drainOutboxOnce } from "./modules/notifications/outbox.js";
 import { reconcileInFlightTickets } from "./modules/money/moneyLoop.js";
 import { aveniaFromEnv } from "./modules/providers/avenia/avenia.client.js";
 import { alertSlaBreachesOnce } from "./modules/admin/aging.js";
+import { runLifecycleSweep } from "./modules/lifecycle/closure.service.js";
 
 const DRAIN_INTERVAL_MS = Number(process.env.DRAIN_INTERVAL_MS ?? 5000);
 
@@ -45,7 +46,10 @@ export function startServer(app: Express): void {
         if (avenia && tick % 12 === 0) await reconcileInFlightTickets(avenia);
         // Admission-SLA sweep: shortly after boot, then hourly (720 ticks at 5s). The
         // exists-dedupe inside makes any cadence safe.
-        if (tick === 1 || tick % 720 === 0) await alertSlaBreachesOnce(env.sla.admissionDays);
+        if (tick === 1 || tick % 720 === 0) {
+          await alertSlaBreachesOnce(env.sla.admissionDays);
+          await runLifecycleSweep(); // stale warnings/expiry, dormancy, retention, rate_limits GC
+        }
       } catch (err) {
         console.warn("drain.tick_failed", err instanceof Error ? err.message : String(err));
       } finally {

@@ -27,6 +27,11 @@ const SAMPLES: Record<TemplateId, Record<string, unknown>> = {
   ownership_transferred: { fromName: "Maria Souza", toName: "João Lima" },
   post_recovery_hold: {},
   admin_alert: { title: "sla_breach", detail: '{"orgId":"…","cnpj":"…","elapsedDays":3.2}' },
+  closure_completed: { razaoSocial: "Acme Comércio Ltda" },
+  stale_warning_60d: {},
+  stale_warning_80d: { daysLeft: 10 },
+  application_expired: {},
+  dormancy_outreach: {},
   returned_to_complete: {},
 };
 

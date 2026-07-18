@@ -13,7 +13,8 @@ export type OrgState =
   | "rfi_required"
   | "active"
   | "declined"
-  | "rejected";
+  | "rejected"
+  | "closed"; // voluntary closure (PRD-01 §13.1) — terminal; closed_at anchors retention
 
 export type AdmissionState = "pending" | "approved" | "rejected";
 
@@ -34,9 +35,10 @@ export const ORG_TRANSITIONS: Record<OrgState, OrgState[]> = {
   kyb_in_progress: ["vendor_pending", "rfi_required", "declined"],
   vendor_pending: ["active", "rejected", "rfi_required"],
   rfi_required: ["vendor_pending", "rejected", "kyb_in_progress"], // kyb_in_progress: RFI re-launches Didit (customer "Reiniciar verificação")
-  active: [],
+  active: ["closed"], // voluntary closure only — zero balance under the money lock (Pattern 13)
   declined: [],
   rejected: [],
+  closed: [],
 };
 
 /** True if `to` is a permitted next state from `from`. */

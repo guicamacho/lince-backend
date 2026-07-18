@@ -125,6 +125,54 @@ export const TEMPLATES = {
     tipping_off_reviewed: true,
     recipientClass: "customer",
   },
+  // LIVE — closeOrgForOwner (Cluster 3). Copy per PRD-14 §5D.
+  closure_completed: {
+    version: 1,
+    locale: "pt-BR",
+    subject: "Sua conta foi encerrada",
+    body: "A conta da {{razaoSocial}} na Lince foi encerrada. Os registros exigidos por lei permanecem guardados pelo prazo legal. Obrigado por ter usado a Lince.",
+    tipping_off_reviewed: true,
+    recipientClass: "customer",
+  },
+  // LIVE — lifecycle sweep (Cluster 3), stale application at 60d. PRD-14 §5B.
+  stale_warning_60d: {
+    version: 1,
+    locale: "pt-BR",
+    subject: "Sua solicitação está parada",
+    body: "Sua solicitação de abertura de conta está sem atividade há 60 dias. Para continuar, acesse sua conta e conclua as etapas pendentes.",
+    tipping_off_reviewed: true,
+    recipientClass: "customer",
+    cta: { label: "Continuar minha solicitação", path: "/onboarding" },
+  },
+  // LIVE — lifecycle sweep, final warning at 80d. PRD-14 §5B.
+  stale_warning_80d: {
+    version: 1,
+    locale: "pt-BR",
+    subject: "Sua solicitação expira em breve",
+    body: "Sem atividade, sua solicitação de abertura de conta expira em {{daysLeft}} dias. Para continuar de onde parou, acesse sua conta.",
+    tipping_off_reviewed: true,
+    recipientClass: "customer",
+    cta: { label: "Continuar minha solicitação", path: "/onboarding" },
+  },
+  // LIVE — lifecycle sweep, expiry at 90d (application soft-deleted). PRD-14 §5B.
+  application_expired: {
+    version: 1,
+    locale: "pt-BR",
+    subject: "Sua solicitação expirou",
+    body: "Sua solicitação de abertura de conta expirou por falta de atividade. Se ainda tiver interesse, você pode iniciar uma nova solicitação quando quiser.",
+    tipping_off_reviewed: true,
+    recipientClass: "customer",
+  },
+  // LIVE — lifecycle sweep, dormant active org. NEUTRAL on purpose: says nothing about
+  // reviews or requirements (PRD-14 §5D ⚠).
+  dormancy_outreach: {
+    version: 1,
+    locale: "pt-BR",
+    subject: "Sua conta Lince continua disponível",
+    body: "Notamos que sua conta está sem movimentação há algum tempo. Ela continua ativa e disponível. Se preferir encerrá-la, você pode fazer isso nas configurações.",
+    tipping_off_reviewed: true,
+    recipientClass: "customer",
+  },
   // ADMIN — generic ops alert (Slack). Exempt from the tipping-off gate; the alert kind
   // rides in the outbox row's event_type and payload.title, detail is pre-serialized.
   admin_alert: {

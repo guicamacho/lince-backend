@@ -23,7 +23,8 @@ export type Permission =
   | "manage_settings"
   | "manage_billing"
   | "add_org"
-  | "transfer_ownership";
+  | "transfer_ownership"
+  | "close_account";
 
 // PRD-03 §1 matrix, verbatim. owner === admin + transfer_ownership (+ protection, enforced
 // in team.service, not here).
@@ -43,6 +44,7 @@ const MATRIX: Record<Permission, readonly AccessRole[]> = {
   manage_billing: OWNER_ADMIN,
   add_org: OWNER_ADMIN,
   transfer_ownership: ["owner"],
+  close_account: ["owner"], // voluntary closure (PRD-01 §13.1) — owner-only, like transfer
 };
 
 /** The access-role subset of a raw org_people.roles array (KYB tags dropped by construction). */

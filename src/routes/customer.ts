@@ -24,6 +24,7 @@ import { getRates, type RateQuoteFn } from "../modules/money/rates.service.js";
 import { aveniaFromEnv } from "../modules/providers/avenia/avenia.client.js";
 import { listBeneficiariesForOrg, createBeneficiaryForOrg } from "../modules/beneficiaries/beneficiaries.service.js";
 import { listMembers, inviteMember, resendInvitation, changeMemberRole, removeMember, transferOwnership } from "../modules/team/team.service.js";
+import { closeOrgForOwner } from "../modules/lifecycle/closure.service.js";
 import { sendFreshInvitation, revokeInvitationsFor } from "../modules/team/clerkInvitations.js";
 import { submitDocument, listDocumentsForCase, MAX_DOC_BYTES } from "../modules/documents/documents.service.js";
 import { MockDiditDocuments, DiditDocuments } from "../modules/providers/didit/documents.js";
@@ -231,6 +232,19 @@ export function registerCustomerRoutes(app: Express): void {
     await removeMember(res.locals.orgId, res.locals.personId, String(req.params.personId), revokeInvitationsFor);
     res.json({ removed: true });
   });
+
+  // Voluntary closure (PRD-01 §13.1 / Cluster 3): owner-only, step-up + 2FA, zero-balance
+  // under the money lock inside the service. Terminal — the /app gate closes by itself.
+  app.post(
+    "/app/closure",
+    rateLimit("beneficiary_write"),
+    requirePermission("close_account"),
+    requireStepUp(env.stepUp.enforced),
+    requireMfaEnrolled(),
+    async (_req: Request, res: Response) => {
+      res.json(await closeOrgForOwner(res.locals.orgId, res.locals.personId));
+    },
+  );
 
   // Owner-only + step-up (PRD-03 F7: step-up + confirm; audit-logged in the service).
   app.post(
