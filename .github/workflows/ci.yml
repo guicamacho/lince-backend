@@ -51,3 +51,17 @@ jobs:
       - run: flyctl deploy --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  # TEST tier (Environments strategy 262373377): promotion = merge dev -> staging.
+  # Needs the repo secret FLY_API_TOKEN_TEST (fly tokens create deploy -a lince-api-test).
+  deploy-test:
+    if: github.ref == 'refs/heads/staging' && github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency: deploy-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only --config fly.test.toml
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_TEST }}
