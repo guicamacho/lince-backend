@@ -9,7 +9,8 @@
  * Idempotent: if this Clerk user already has a live org, returns it (the customer
  * app may call this more than once around signup).
  */
-import { withTransaction } from "../../db/pool.js";
+import { pool, withTransaction } from "../../db/pool.js";
+import { lookupCnpj } from "./cnpjLookup.js";
 import { acquireOrgOnboardingLock } from "../../db/lockKeys.js";
 import { HttpError } from "../../http/error.js";
 import { CONSENT_VERSIONS, type ConsentVersions } from "./consent.js";
@@ -39,7 +40,8 @@ export interface BootstrapResult {
   state: string;
 }
 
-export async function bootstrapOrgForClerkUser(clerkUserId: string, input: BootstrapInput): Promise<BootstrapResult> {
+export async function bootstrapOrgForClerkUser(clerkUserId: string, input: BootstrapInput,
+  checkCnpj?: ((clerkUserId: string, cnpj: string) => Promise<{ ativa: boolean }>) | null): Promise<BootstrapResult> {
   const cnpj = (input.cnpj ?? "").replace(/\D/g, "");
   const razao = (input.razaoSocial ?? "").trim();
   const fullName = (input.fullName ?? "").trim();
@@ -53,6 +55,36 @@ export async function bootstrapOrgForClerkUser(clerkUserId: string, input: Boots
   if (!fullName) missing.push("fullName");
   if (!email) missing.push("email");
   if (missing.length) throw new HttpError(`incomplete: ${missing.join(", ")}`, 422);
+
+  // PRD-01 AC-1: server-side ATIVA check (completeness, not risk — situação cadastral is a
+  // Receita fact). FAIL-OPEN on registry outage: a BrasilAPI 5xx must never block signups;
+  // the attestation records whether the check ran. cnpj_not_found/invalid still reject.
+  // Injectable for tests; under NODE_ENV=test the default is OFF (no live BrasilAPI calls
+  // from the suite — same guard pattern as the server listen).
+  let situacaoChecked = false;
+  const check = checkCnpj ?? (process.env.NODE_ENV === "test" ? null : lookupCnpj);
+  // Idempotent re-calls (double-click, client retry) must return the existing org, never
+  // re-consult the registry — a transient BrasilAPI 404 or situação drift would otherwise
+  // fail a signup that already succeeded. TOCTOU here is harmless: the tx short-circuit
+  // below is authoritative.
+  const { rows: existing } = await pool.query(
+    `select 1 from people p join org_people op on op.person_id = p.id
+      where p.clerk_user_id = $1 limit 1`,
+    [clerkUserId],
+  );
+  if (check && !existing.length) {
+    try {
+      const reg = await check(clerkUserId, cnpj);
+      situacaoChecked = true;
+      if (!reg.ativa) throw new HttpError("cnpj_not_ativa", 422);
+    } catch (e) {
+      if (e instanceof HttpError && e.message === "cnpj_lookup_unavailable") {
+        situacaoChecked = false; // outage — proceed, attest unchecked
+      } else {
+        throw e;
+      }
+    }
+  }
 
   return withTransaction(async (c) => {
     // Serialize concurrent signups for the same company (pattern 9). Keyed on the CNPJ
@@ -115,6 +147,14 @@ export async function bootstrapOrgForClerkUser(clerkUserId: string, input: Boots
     await c.query(
       `insert into org_people (org_id, person_id, roles, status) values ($1,$2,'{owner,legal_rep}','active')`,
       [orgRow.id, personId],
+    );
+
+    // PRD-01 AC-1 attestation: record that the situação-cadastral check ran (or that the
+    // registry was down and signup proceeded fail-open). Rejections never reach here.
+    await c.query(
+      `insert into audit_log (org_id, actor_type, actor_id, event, payload)
+       values ($1, 'system', null, 'signup.cnpj_situacao_checked', $2)`,
+      [orgRow.id, JSON.stringify({ checked: situacaoChecked, ativa: situacaoChecked ? true : null, source: "brasilapi" })],
     );
 
     // Versioned ToS-acceptance event — once per org (this branch only runs when a new

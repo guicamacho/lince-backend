@@ -27,7 +27,7 @@ export interface OrgDetail {
 
 export async function getOrgDetail(orgId: string): Promise<OrgDetail> {
   const org = await pool.query(
-    `select o.id, o.cnpj, o.razao_social, o.country_code, o.state, o.admission_state,
+    `select o.id, '••••••••••' || right(o.cnpj, 4) as cnpj, o.razao_social, o.country_code, o.state, o.admission_state,
             o.access_status, o.access_reason, o.access_source, o.access_changed_at,
             o.kyb_forwarded_at, o.activated_at, o.created_at,
             o.admission_authority_used, o.admission_external_ref, o.admission_recorded_at,

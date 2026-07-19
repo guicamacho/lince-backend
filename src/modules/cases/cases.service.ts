@@ -60,7 +60,10 @@ export async function listCases(filter: ListCasesFilter = {}) {
     `select c.id, c.org_id, c.type, c.status, c.priority, c.summary, c.assigned_admin_id,
             c.opened_by, c.opened_at, c.closed_at,
             o.razao_social as org_name,
-            (select max(m.created_at) from case_messages m where m.case_id = c.id) as last_message_at
+            (select max(m.created_at) from case_messages m where m.case_id = c.id) as last_message_at,
+            (select min(m.created_at) from case_messages m
+              where m.case_id = c.id and m.author_type = 'admin'
+                and m.customer_visible = true) as first_admin_response_at
        from cases c
        left join orgs o on o.id = c.org_id
        ${clause}
@@ -84,7 +87,7 @@ export async function getCaseDetail(caseId: string) {
   let org = null;
   if (caseRow.org_id) {
     const { rows: o } = await pool.query(
-      `select id, razao_social, cnpj, state from orgs where id = $1`,
+      `select id, razao_social, '••••••••••' || right(cnpj, 4) as cnpj, state from orgs where id = $1`,
       [caseRow.org_id],
     );
     org = o[0] ?? null;

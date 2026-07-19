@@ -14,7 +14,7 @@ import { UUID_RE } from "./cases.service.js";
 // message (D1/D3: rfi_relay + kyb_completeness for v1). customer_inquiry/customer_dispute are
 // reserved for A2 (customer-initiated) and intentionally NOT here; avenia_decision_relay,
 // manual_review, support, etc. can never reach the customer inbox — the tipping-off wall.
-export const CUSTOMER_FACING_CASE_TYPES = new Set(["rfi_relay", "kyb_completeness"]);
+export const CUSTOMER_FACING_CASE_TYPES = new Set(["rfi_relay", "kyb_completeness", "customer_dispute"]);
 
 // L2 — the pure message gate (the isSendable analogue). No DB, unit-tested. Defaults closed:
 // customer_visible must be explicitly requested AND the case type must be allowlisted.
@@ -27,6 +27,7 @@ export function messageCanBeCustomerVisible(caseType: string, requested: boolean
 export const NEUTRAL_NOTIFICATION_COPY: Record<string, { title: string; body: string }> = {
   rfi_relay:        { title: "Atualização na sua solicitação", body: "Há uma atualização na sua solicitação. Acesse para ver os detalhes." },
   kyb_completeness: { title: "Atualização no seu cadastro",    body: "Há uma atualização no seu cadastro. Acesse para ver os detalhes." },
+  customer_dispute: { title: "Atualização na sua manifestação", body: "Há uma atualização na sua manifestação. Acesse para ver os detalhes." },
 };
 
 export interface PostAdminMessageInput {

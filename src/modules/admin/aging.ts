@@ -30,7 +30,7 @@ export interface AdmissionAging {
 
 export async function getAdmissionAging(thresholdDays: number): Promise<AdmissionAging> {
   const pending = await pool.query<AgingRow>(
-    `select o.id as org_id, o.cnpj, o.razao_social, o.kyb_forwarded_at,
+    `select o.id as org_id, '••••••••••' || right(o.cnpj, 4) as cnpj, o.razao_social, o.kyb_forwarded_at,
             extract(epoch from (now() - o.kyb_forwarded_at))::float8 as elapsed_seconds,
             (now() - o.kyb_forwarded_at) > make_interval(days => $1::int) as breached
        from orgs o
@@ -76,7 +76,7 @@ export async function getAdmissionAging(thresholdDays: number): Promise<Admissio
 export async function alertSlaBreachesOnce(thresholdDays: number): Promise<number> {
   return withTransaction(async (c) => {
     const { rows } = await c.query<{ org_id: string; cnpj: string; razao_social: string; elapsed_days: number }>(
-      `select o.id as org_id, o.cnpj, o.razao_social,
+      `select o.id as org_id, '••••••••••' || right(o.cnpj, 4) as cnpj, o.razao_social,
               (extract(epoch from (now() - o.kyb_forwarded_at)) / 86400.0)::float8 as elapsed_days
          from orgs o
         where o.admission_state = 'pending' and o.deleted_at is null and o.kyb_forwarded_at is not null

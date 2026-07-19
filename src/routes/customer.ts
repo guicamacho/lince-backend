@@ -23,7 +23,7 @@ import { balancesForOrg, balanceHistoryForOrg } from "../modules/ledger/ledger.s
 import { getRates, type RateQuoteFn } from "../modules/money/rates.service.js";
 import { getEffectiveSpreads, applySpreads } from "../modules/money/fxSpreads.js";
 import { aveniaFromEnv } from "../modules/providers/avenia/avenia.client.js";
-import { listBeneficiariesForOrg, createBeneficiaryForOrg } from "../modules/beneficiaries/beneficiaries.service.js";
+import { listBeneficiariesForOrg, createBeneficiaryForOrg, updateBeneficiaryForOrg } from "../modules/beneficiaries/beneficiaries.service.js";
 import { listMembers, inviteMember, resendInvitation, changeMemberRole, removeMember, transferOwnership } from "../modules/team/team.service.js";
 import { closeOrgForOwner } from "../modules/lifecycle/closure.service.js";
 import { sendFreshInvitation, revokeInvitationsFor } from "../modules/team/clerkInvitations.js";
@@ -35,6 +35,7 @@ import {
   listCustomerCasesForOrg,
   getCaseThreadForOrg,
   postCustomerCaseReply,
+  createDisputeForOrg,
 } from "../modules/cases/customerInbox.service.js";
 
 export function registerCustomerRoutes(app: Express): void {
@@ -204,6 +205,44 @@ export function registerCustomerRoutes(app: Express): void {
 
   // --- Team (PRD-03 F1/F3/F7). requirePermission is the WHO gate (owner/admin); the service
   //     enforces WHAT is legal (owner protected, picker never offers owner, KYB tags inert). ---
+
+  // Edit a payee (PRD-03 §13.2 change control). Same money-out stack as create; the
+  // service decides label-only vs destination-reset semantics.
+  app.patch(
+    "/app/beneficiaries/:id",
+    rateLimit("beneficiary_write"),
+    requirePermission("manage_beneficiaries"),
+    requireStepUp(env.stepUp.enforced),
+    requireMfaEnrolled(),
+    async (req: Request, res: Response) => {
+      res.json(
+        await updateBeneficiaryForOrg(
+          res.locals.orgId,
+          getAuth(req).userId,
+          String(req.params.id),
+          (req.body ?? {}) as Record<string, unknown>,
+        ),
+      );
+    },
+  );
+
+  // Dispute intake (PRD-04 §13.1): "report a problem" on one of the org's transactions.
+  // respond_cases (MONEY roles) — a viewer cannot open money-path correspondence.
+  app.post(
+    "/app/disputes",
+    rateLimit("beneficiary_write"),
+    requirePermission("respond_cases"),
+    async (req: Request, res: Response) => {
+      const { transactionId, message } = (req.body ?? {}) as { transactionId?: string; message?: string };
+      if (!transactionId || !message) {
+        res.status(422).json({ error: "transactionId_and_message_required" });
+        return;
+      }
+      res.status(201).json(
+        await createDisputeForOrg(res.locals.orgId, res.locals.personId ?? null, { transactionId, message }),
+      );
+    },
+  );
 
   app.get("/app/team", rateLimit("reads"), async (_req: Request, res: Response) => {
     res.json({ members: await listMembers(res.locals.orgId) });

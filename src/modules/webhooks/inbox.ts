@@ -10,7 +10,9 @@
  *
  * Returns the HTTP status the route should send; the integrator delegates the route body here.
  */
-import { pool } from "../../db/pool.js";
+import { pool, withTransaction } from "../../db/pool.js";
+import { enqueueAdminAlert } from "../notifications/outbox.js";
+import { env } from "../../config/env.js";
 import { verifyWebhook, VERIFIED_PROVIDERS, KNOWN_PROVIDERS, type VerifierConfig, type WebhookHeaders } from "./verify.js";
 
 export interface ReceiveInput {
@@ -38,6 +40,11 @@ export async function receiveWebhook(input: ReceiveInput): Promise<ReceiptOutcom
     return { status: 404, body: { error: "unknown_provider" } };
   }
 
+  // PRD-07 volume ALARM (never a block — providers retry and a 429 becomes a delivery gap):
+  // count every known-provider intake attempt per minute; crossing the threshold pings ops
+  // exactly once per window. Reuses the fixed-window rate_limits table.
+  await recordWebhookVolume(provider);
+
   if (VERIFIED_PROVIDERS.has(provider)) {
     const configured =
       provider === "clerk" ? !!config.clerkSecret
@@ -60,4 +67,29 @@ export async function receiveWebhook(input: ReceiveInput): Promise<ReceiptOutcom
     [provider, externalId, eventType, JSON.stringify(payload ?? {})],
   );
   return { status: 202, body: { received: true } };
+}
+
+/** Fixed-window per-provider intake counter + one ops alert at the crossing. Failures here
+ *  must never break intake — swallow and log. */
+async function recordWebhookVolume(provider: string): Promise<void> {
+  const threshold = env.webhooks.volumeAlarmPerMin;
+  if (!threshold) return;
+  try {
+    const { rows } = await pool.query<{ count: number }>(
+      `insert into rate_limits (key, route_class, window_start, count)
+       values ($1, 'webhook_volume', to_timestamp(floor(extract(epoch from now()) / 60) * 60), 1)
+       on conflict (key, route_class, window_start)
+       do update set count = rate_limits.count + 1
+       returning count`,
+      [`webhook_volume:${provider}`],
+    );
+    if (rows[0]!.count === threshold + 1) {
+      console.warn("security.webhook_volume_alarm", JSON.stringify({ provider, threshold }));
+      await withTransaction((c) =>
+        enqueueAdminAlert(c, "webhook_volume_alarm", { provider, threshold, window: "1m" }),
+      );
+    }
+  } catch (e) {
+    console.warn("webhook_volume_counter_failed", e instanceof Error ? e.message : String(e));
+  }
 }

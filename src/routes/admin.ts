@@ -20,6 +20,7 @@ import { getAdmissionAging } from "../modules/admin/aging.js";
 import { recordAuditExport } from "../modules/admin/auditExport.js";
 import { listAdmins, setAdminRoles } from "../modules/admin/staff.js";
 import { listSpreadConfig, setSpread } from "../modules/money/fxSpreads.js";
+import { listPendingReverification, verifyBeneficiary } from "../modules/beneficiaries/beneficiaries.service.js";
 import { enqueueApproval, listOpenApprovals, decideApproval, type ApprovalActionType } from "../modules/admin/approvals.js";
 import { createCase, listCases, getCaseDetail, assignCase, updateCaseStatus } from "../modules/cases/cases.service.js";
 import { postAdminCaseMessage } from "../modules/cases/messages.service.js";
@@ -30,12 +31,54 @@ const APPROVAL_ACTION_TYPES = ["admission_relay", "org_block", "reversal", "role
 export function registerAdminRoutes(app: Express): void {
   app.use("/admin", requireAdminServiceToken, requireAdminActor, requireAdminAccess);
 
+  // CNPJ is served MASKED (AC14): the full value never reaches the browser by default —
+  // the audited reveal endpoint below is the only path to it.
   app.get("/admin/orgs", rateLimit("admin_export"), async (_req: Request, res: Response) => {
     const { rows } = await pool.query(
-      `select id, cnpj, razao_social, state, admission_state, access_status, kyb_forwarded_at, created_at
+      `select id, '••••••••••' || right(cnpj, 4) as cnpj,
+              razao_social, state, admission_state, access_status, kyb_forwarded_at, created_at
          from orgs where deleted_at is null order by created_at desc limit 200`,
     );
     res.json({ orgs: rows });
+  });
+
+  // AC14: audited reveal — the ONE way to read a full CNPJ from the portal. Every call is
+  // a sensitive-read audit event (who revealed what, when).
+  app.post("/admin/orgs/:id/reveal-cnpj", rateLimit("admin_export"), requireAdminRole("compliance", "treasury_ops", "support"), async (req: Request, res: Response) => {
+    const orgId = String(req.params.id);
+    if (!/^[0-9a-f-]{36}$/i.test(orgId)) {
+      res.status(404).json({ error: "org_not_found" });
+      return;
+    }
+    const { rows } = await pool.query<{ cnpj: string }>(
+      `select cnpj from orgs where id = $1`,
+      [orgId],
+    );
+    if (!rows[0]) {
+      res.status(404).json({ error: "org_not_found" });
+      return;
+    }
+    await pool.query(
+      `insert into audit_log (org_id, actor_type, actor_id, event, payload)
+       values ($1, 'ops', $2, 'admin.identifier_revealed', $3)`,
+      [orgId, actingAdminId(res), JSON.stringify({ entity: "cnpj" })],
+    );
+    res.json({ cnpj: rows[0].cnpj });
+  });
+
+  // §13.2 re-verification queue: payees whose destination changed, awaiting the
+  // operational approval that makes them payable again.
+  app.get("/admin/beneficiaries/reverification", rateLimit("admin_export"), async (_req: Request, res: Response) => {
+    res.json({ beneficiaries: await listPendingReverification() });
+  });
+
+  app.post("/admin/beneficiaries/:id/verify", rateLimit("admin_export"), requireAdminRole("compliance", "treasury_ops"), async (req: Request, res: Response) => {
+    const ok = await verifyBeneficiary(String(req.params.id), actingAdminId(res));
+    if (!ok) {
+      res.status(409).json({ error: "not_pending_reverification" });
+      return;
+    }
+    res.json({ verified: true });
   });
 
   // Unified all-orgs transactions view (PRD-04 §4.4): Avenia ticket lifecycle straight from the
@@ -205,7 +248,7 @@ export function registerAdminRoutes(app: Express): void {
   // `state` is untouched — this is an operational gate, not an admission decision. The
   // mandatory reason is enforced in setOrgAccess and audit-logged as org.access_changed.
   app.post("/admin/orgs/:id/access", rateLimit("admin_export"), requireAdminRole("compliance"), async (req: Request, res: Response) => {
-    const { action, reason, source } = req.body ?? {};
+    const { action, reason, source, expected_status: expectedStatus } = req.body ?? {};
     if (action !== "suspend" && action !== "block" && action !== "reinstate") {
       res.status(400).json({ error: "invalid_action" });
       return;
@@ -216,7 +259,10 @@ export function registerAdminRoutes(app: Express): void {
     }
     const orgId = String(req.params.id);
     const adminId = actingAdminId(res);
-    await setOrgAccess({ orgId, action, reason: String(reason ?? ""), source, changedByAdminId: adminId });
+    await setOrgAccess({
+      orgId, action, reason: String(reason ?? ""), source, changedByAdminId: adminId,
+      ...(expectedStatus !== undefined ? { expectedStatus: String(expectedStatus) } : {}),
+    });
     const { rows } = await pool.query(
       "select id, state, access_status, access_reason, access_changed_at from orgs where id = $1",
       [orgId],

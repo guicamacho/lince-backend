@@ -18,6 +18,10 @@ export interface SetOrgAccessInput {
   reason: string;
   source?: AccessSource; // defaults to lince_operational
   changedByAdminId: string; // admin_users.id of the acting ops user
+  /** Strict CAS (PRD-07): when set, the change applies only if the CURRENT status still
+   *  matches — an operator acting on a stale screen gets a 409 instead of clobbering a
+   *  concurrent change. Optional for backward compatibility (approvals may lack it). */
+  expectedStatus?: string;
 }
 
 // No transition guard: each action maps to an absolute target status. The set is
@@ -42,6 +46,10 @@ export async function setOrgAccess(input: SetOrgAccessInput, client?: pg.PoolCli
     );
     const from = rows[0]?.access_status;
     if (!from) throw new HttpError("org_not_found", 404);
+    // CAS under the row lock: atomic vs concurrent writers, explicit vs stale operators.
+    if (input.expectedStatus !== undefined && input.expectedStatus !== from) {
+      throw new HttpError("access_status_conflict", 409);
+    }
 
     const to = TARGET_STATUS[input.action];
     const source = input.source ?? "lince_operational";

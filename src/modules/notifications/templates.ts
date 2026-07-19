@@ -125,6 +125,34 @@ export const TEMPLATES = {
     tipping_off_reviewed: true,
     recipientClass: "customer",
   },
+  // LIVE — updateBeneficiaryForOrg destination change (PRD-03 §13.2d — the open-item-#5
+  // channel now exists). Security notice: says what happened; "em verificação" framing.
+  beneficiary_destination_changed: {
+    version: 1,
+    locale: "pt-BR",
+    subject: "Alteração em um beneficiário",
+    body: "Os dados de destino do beneficiário {{label}} foram alterados. Por segurança, o beneficiário fica em verificação antes do próximo pagamento. Se você não reconhece esta alteração, fale com nosso suporte imediatamente.",
+    tipping_off_reviewed: true,
+    recipientClass: "customer",
+  },
+  // LIVE — verifyBeneficiary (admin operational approval clears the §13.2 reset).
+  beneficiary_verified: {
+    version: 1,
+    locale: "pt-BR",
+    subject: "Beneficiário pronto para pagamentos",
+    body: "O beneficiário {{label}} foi verificado e já pode receber pagamentos.",
+    tipping_off_reviewed: true,
+    recipientClass: "customer",
+  },
+  // LIVE — createDisputeForOrg (PRD-04 §13.1). Neutral ack; SLA commitment only.
+  dispute_received_ack: {
+    version: 1,
+    locale: "pt-BR",
+    subject: "Recebemos sua solicitação",
+    body: "Recebemos sua manifestação e ela já está com nossa equipe. Responderemos em até {{slaPrazo}}.",
+    tipping_off_reviewed: true,
+    recipientClass: "customer",
+  },
   // LIVE — closeOrgForOwner (Cluster 3). Copy per PRD-14 §5D.
   closure_completed: {
     version: 1,

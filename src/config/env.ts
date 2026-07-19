@@ -76,6 +76,8 @@ export const env = {
   // see modules/webhooks/aveniaKey.ts).
   webhooks: {
     resendSecret: optional("RESEND_WEBHOOK_SECRET"),
+    // Per-provider intake alarm threshold (events/minute). 0 disables. Alert, never block.
+    volumeAlarmPerMin: Number(optional("WEBHOOK_VOLUME_ALARM_PER_MIN") ?? 300),
   },
   // Admin staff identity + RBAC (PRD-08 §5.1). When adminClerk.secretKey is set, the backend
   // VERIFIES the admin's forwarded Clerk session token against the admin instance (binding the
@@ -102,5 +104,8 @@ export const env = {
   // per canon (business-day math is reserved for IFTI/SMR). Default 2.
   sla: {
     admissionDays: Number(optional("ADMISSION_SLA_DAYS") ?? 2),
+    // First-response commitment for customer disputes (PRD-04 §13.1). Drives the ack
+    // email's {{slaDays}} and the admin first-response timer.
+    disputeFirstResponseHours: Number(optional("DISPUTE_FIRST_RESPONSE_HOURS") ?? 24),
   },
 } as const;

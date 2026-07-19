@@ -23,11 +23,14 @@ function keyFor(scope: KeyScope, req: Request, res: Response): string | null {
     case "org":
       // The /app gate sets res.locals.orgId (the Lince org UUID) before route middleware runs.
       return (res.locals.orgId as string | undefined) ?? null;
-    case "admin":
-      // Admin routes are service-token gated; the admin id lives in the request body (parsed
-      // in the handler, not here). Key on the caller IP. NEVER null — a missing IP falls into
-      // one shared bucket (still capped) rather than silently bypassing the limit.
-      return req.ip ?? "unknown-ip";
+    case "admin": {
+      // requireAdminActor runs on the /admin mount BEFORE route middleware, so in verified
+      // mode the acting admin is known here — key per admin, not per IP (PRD-07: one hot
+      // admin must not throttle the rest of ops). Legacy mode / reads without a body
+      // identity fall back to IP; NEVER null (a missing IP shares one capped bucket).
+      const actor = res.locals.adminActor as { adminId?: string } | undefined;
+      return actor?.adminId ?? req.ip ?? "unknown-ip";
+    }
     case "ip":
       // Real client IP needs `trust proxy` set to the exact hop count (app.ts). Fall back to a
       // shared bucket, never null, so an IP tier can't be bypassed by an absent/again-null IP.

@@ -22,8 +22,10 @@ test("messageCanBeCustomerVisible is the pure allowlist gate", () => {
   assert.equal(messageCanBeCustomerVisible("kyb_completeness", true), true);
   // defaults closed — must be explicitly requested
   assert.equal(messageCanBeCustomerVisible("rfi_relay", false), false);
-  // reserved (A2) + never-facing types can never be customer-visible
-  for (const t of ["customer_inquiry", "customer_dispute", "avenia_decision_relay",
+  // customer_dispute joined the allowlist with the §13.1 intake (small-gaps batch)
+  assert.equal(messageCanBeCustomerVisible("customer_dispute", true), true);
+  // reserved + never-facing types can never be customer-visible
+  for (const t of ["customer_inquiry", "avenia_decision_relay",
                    "manual_review", "support", "beneficiary_review", "recon_break", "dormant_review"]) {
     assert.equal(messageCanBeCustomerVisible(t, true), false, t);
   }

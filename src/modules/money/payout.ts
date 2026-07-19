@@ -15,6 +15,7 @@
  * the org, be on a payable rail, and be active; and the 24h post-recovery hold (PRD-07 v5).
  */
 import { createHash } from "node:crypto";
+import { pool } from "../../db/pool.js";
 import { HttpError } from "../../http/error.js";
 import { parseCustomerAmount, type Currency } from "../../money/money.js";
 import { getPayoutBeneficiary, ensureAveniaBeneficiary, type PayoutBeneficiary } from "../beneficiaries/beneficiaries.service.js";
@@ -162,7 +163,23 @@ export async function createPayout(
     throw new HttpError("unsupported_rail", 422);
   }
   if (beneficiary.status !== "active") throw new HttpError("beneficiary_disabled", 422);
+  // §13.2 change control: a destination-changed payee is NOT payable until an admin
+  // re-verifies it (born-active applies to CREATION only; edits are the fraud vector).
+  if (beneficiary.verification_status === "changed_pending") {
+    throw new HttpError("beneficiary_reverification_pending", 422);
+  }
   rail.gate?.(beneficiary);
+  // PRD-01 AC-15, fail-open by design: usd_state/eur_state default 'not_requested' and the
+  // sandbox never sets them, so ONLY the explicit negative ('rejected') blocks the rail.
+  // F7 (the real rail-unlock flow) will tighten this to require 'approved' in production.
+  if (beneficiary.rail === "ach" || beneficiary.rail === "fedwire" || beneficiary.rail === "sepa") {
+    const col = beneficiary.rail === "sepa" ? "eur_state" : "usd_state";
+    const { rows: acct } = await pool.query<{ state: string | null }>(
+      `select ${col} as state from avenia_accounts where org_id = $1`,
+      [orgId],
+    );
+    if (acct[0]?.state === "rejected") throw new HttpError("rail_not_enabled", 422);
+  }
   // Post-recovery hold + access re-check live in runMoneyLoop (Cluster 2) — not repeated here.
 
   const amountMinor = parseCustomerAmount(input.amount, sourceCurrency);
