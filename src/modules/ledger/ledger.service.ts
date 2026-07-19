@@ -110,18 +110,32 @@ export interface BalanceHistoryDay {
   balances: Record<string, number>; // minor units per currency, cumulative
 }
 
+const HISTORY_DAYS = 400; // ~13 months of daily points; older activity becomes the opening
+
 export async function balanceHistoryForOrg(orgId: string): Promise<BalanceHistoryDay[]> {
+  // Review 2026-07-20 L3: the day walk is bounded to the last HISTORY_DAYS; older activity
+  // collapses into per-currency OPENING balances so the chart's first day is still correct.
   const { rows } = await pool.query<{ day: string; currency: string; delta: string }>(
     `select to_char((p.created_at at time zone 'America/Sao_Paulo')::date, 'YYYY-MM-DD') as day,
             p.currency, (-sum(p.amount))::text as delta
        from ledger_postings p
        join ledger_accounts a on a.id = p.account_id
       where a.org_id = $1 and a.type = 'customer_liability'
+        and p.created_at >= now() - make_interval(days => ${HISTORY_DAYS})
       group by 1, 2
       order by 1`,
     [orgId],
   );
-  if (!rows.length) return [];
+  const { rows: openings } = await pool.query<{ currency: string; total: string }>(
+    `select p.currency, (-sum(p.amount))::text as total
+       from ledger_postings p
+       join ledger_accounts a on a.id = p.account_id
+      where a.org_id = $1 and a.type = 'customer_liability'
+        and p.created_at < now() - make_interval(days => ${HISTORY_DAYS})
+      group by 1`,
+    [orgId],
+  );
+  if (!rows.length && !openings.length) return [];
 
   const deltasByDay = new Map<string, Array<{ currency: string; delta: number }>>();
   for (const r of rows) {
@@ -131,9 +145,11 @@ export async function balanceHistoryForOrg(orgId: string): Promise<BalanceHistor
   }
   const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" });
   const running: Record<string, number> = {};
+  for (const o of openings) running[o.currency] = Number(o.total);
   const out: BalanceHistoryDay[] = [];
   // Walk day by day from the first posting to today, carrying balances across quiet days.
-  for (let d = new Date(`${rows[0]!.day}T00:00:00Z`); ; d.setUTCDate(d.getUTCDate() + 1)) {
+  const firstDay = rows[0]?.day ?? today;
+  for (let d = new Date(`${firstDay}T00:00:00Z`); ; d.setUTCDate(d.getUTCDate() + 1)) {
     const day = d.toISOString().slice(0, 10);
     for (const { currency, delta } of deltasByDay.get(day) ?? []) {
       running[currency] = (running[currency] ?? 0) + delta;

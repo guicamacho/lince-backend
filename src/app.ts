@@ -38,9 +38,34 @@ if (env.makerCheckerEnabled && !env.adminClerk.secretKey) {
   throw new Error("MAKER_CHECKER_ENABLED requires ADMIN_CLERK_SECRET_KEY (four-eyes needs verified admin identity)");
 }
 if (!env.adminClerk.secretKey) {
+  // Security review 2026-07-20 M2: a DEPLOYED tier without verified admin identity means
+  // every /admin write runs on body-trust behind one static token. Deployed tiers all set
+  // NODE_ENV=production (fly.toml), local dev/tests don't — so production hard-fails and
+  // local keeps the loud warning.
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(
+      "ADMIN_CLERK_SECRET_KEY is required in deployed environments (PRD-08 §5.1) — legacy body-trust admin identity is dev-only.",
+    );
+  }
   console.warn(
     "security.admin_identity_unverified: /admin is running LEGACY body-trust — set ADMIN_CLERK_SECRET_KEY to enforce verified staff identity + RBAC (PRD-08 §5.1).",
   );
+}
+
+// Security review 2026-07-20 M4: the money-path controls default OFF; a deployed tier
+// missing the flags must never run silently unprotected. Warn (not fail — the dev tier
+// legitimately runs loose); the test/staging/prod tomls set both flags ON.
+if (process.env.NODE_ENV === "production") {
+  if (!env.stepUp.enforced) {
+    console.warn("security.step_up_disabled: STEP_UP_ENFORCED is off — money-out has no re-auth freshness gate.");
+  }
+  if (!env.rateLimit.enforced) {
+    console.warn("security.rate_limit_disabled: RATE_LIMIT_ENFORCED is off — no request throttling.");
+  } else if (env.rateLimit.trustProxyHops === 0) {
+    console.warn(
+      "security.trust_proxy_unset: RATE_LIMIT_ENFORCED is on with TRUST_PROXY_HOPS=0 — limiter keys use the proxy IP (self-DoS) or are spoofable. Set the real hop count.",
+    );
+  }
 }
 
 export const app = express();

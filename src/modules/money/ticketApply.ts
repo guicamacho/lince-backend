@@ -128,6 +128,9 @@ export async function applyTicketStatus(
   // beneficiary's bank, outside our ledger. Two postings in the SOURCE currency for the full
   // reserved amount (the PIX-out fee is Avenia's, baked into the smaller BRL output and itemized
   // in the quote snapshot; dest_amount records the BRL actually sent, display-only).
+  // DEPENDENCY (review 2026-07-20 L5): if Avenia ever deducted SOURCE-side fees beyond the
+  // reserved amount, custody would drift from the ledger — the hourly recon comparator is
+  // the control that surfaces that as a balance_drift break.
   if (nextState === "settled" && tx.type === "payout" && tx.source_amount && tx.source_currency) {
     const currency = tx.source_currency as Currency;
     const amount = BigInt(tx.source_amount);

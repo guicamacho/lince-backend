@@ -148,10 +148,16 @@ test("Phase-2 failure with NO ticket at Avenia is released by the reconciler (re
     createConvert(orgId, null, { from: "BRLA", to: "USDT", amount: "50", idemKey: randomUUID() }, client),
     /convert_pending_reconcile/,
   );
+  // Review 2026-07-20 M3: money-out rows keep polling on a null lookup until the long
+  // release window passes — vendor indexing lag must never free live money.
   await ageRow(orgId);
   await reconcileInFlightTickets(client as never, 30);
+  const early = await pool.query<{ state: string }>("select state from org_transactions where org_id = $1", [orgId]);
+  assert.equal(early.rows[0]!.state, "created", "young money-out row is NOT released early");
+  await pool.query("update org_transactions set updated_at = now() - interval '16 minutes' where org_id = $1", [orgId]);
+  await reconcileInFlightTickets(client as never, 30);
   const row = await pool.query<{ state: string }>("select state from org_transactions where org_id = $1", [orgId]);
-  assert.equal(row.rows[0]!.state, "failed", "no ticket existed -> reservation released");
+  assert.equal(row.rows[0]!.state, "failed", "past the window, no ticket -> reservation released");
   // Balance never moved, and the full amount is convertible again.
   const ok = await createConvert(orgId, null, { from: "BRLA", to: "USDT", amount: "100", idemKey: randomUUID() }, fakeClient());
   assert.equal(ok.state, "funding");

@@ -210,11 +210,16 @@ export function mapVendorFees(raw: unknown): MappedFee[] {
  * `quietSeconds` are polled, so webhooks always win when they're flowing; per-run cap keeps
  * Avenia calls bounded (rate limits unconfirmed — Avenia question #10).
  */
+/** Money-out rows with no ticket found are released only after this quiet window — long
+ *  enough that "not found" means absent, not un-indexed (review 2026-07-20 M3). */
+export const MONEY_OUT_NO_TICKET_RELEASE_SECONDS = 900;
+
 export async function reconcileInFlightTickets(rail: TicketReader, quietSeconds = 45, limit = 10): Promise<number> {
   // Includes 'created' rows with a NULL vendor_ref: these are crash-orphans (ticket live at
   // Avenia, id never persisted). We recover them by externalId (= idem_key) below.
-  const { rows } = await pool.query<{ id: string; vendor_ref: string | null; idem_key: string; subaccount_id: string | null; dest_currency: string | null }>(
-    `select t.id, t.vendor_ref, t.idem_key::text as idem_key, a.subaccount_id, t.dest_currency
+  const { rows } = await pool.query<{ id: string; vendor_ref: string | null; idem_key: string; subaccount_id: string | null; dest_currency: string | null; type: string; quiet_secs: number }>(
+    `select t.id, t.vendor_ref, t.idem_key::text as idem_key, a.subaccount_id, t.dest_currency, t.type,
+            extract(epoch from (now() - t.updated_at))::float8 as quiet_secs
        from org_transactions t
        left join avenia_accounts a on a.org_id = t.org_id
       where t.provider_code = 'avenia'
@@ -239,7 +244,16 @@ export async function reconcileInFlightTickets(rail: TicketReader, quietSeconds 
       // No ticket at Avenia. A null-vendor_ref 'created' row never got one (create never reached
       // Avenia), so nothing executed — release it, or a money-out reservation would hold the
       // customer's balance forever. A vendor_ref row is a transient lookup miss: keep polling.
-      if (!r.vendor_ref) {
+      //
+      // MONEY-OUT CAUTION (security review 2026-07-20 M3): a swap/payout ticket auto-executes
+      // the instant it is POSTed, and a SUCCESSFUL null from findTicketByExternalId could be
+      // vendor-side indexing lag, not proof of absence. Releasing on the first null would free
+      // the reservation while money may have moved (double-spend). So money-out rows are only
+      // released after a much longer quiet window; deposits (a charge nobody paid) release on
+      // the normal cadence — failing a deposit row can never move money.
+      const releasable =
+        r.type === "deposit" || r.quiet_secs >= MONEY_OUT_NO_TICKET_RELEASE_SECONDS;
+      if (!r.vendor_ref && releasable) {
         await pool.query(
           `update org_transactions set state = 'failed', error = $2, updated_at = now()
              where id = $1 and state = 'created'`,

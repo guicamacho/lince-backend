@@ -390,7 +390,13 @@ test("Phase-2 failure with NO ticket at Avenia is released by the reconciler (re
     createPayout(orgId, null, { beneficiaryId: benId, amount: "50", idemKey: randomUUID() }, client),
     /payout_pending_reconcile/,
   );
+  // Review 2026-07-20 M3: a young money-out row is NOT released on a null lookup — vendor
+  // indexing lag must not free a reservation whose money may have moved.
   await ageRow(orgId);
+  await reconcileInFlightTickets(client as never, 30);
+  const early = await pool.query<{ state: string }>("select state from org_transactions where org_id = $1", [orgId]);
+  assert.equal(early.rows[0]!.state, "created", "young money-out row keeps polling, never released early");
+  await pool.query("update org_transactions set updated_at = now() - interval '16 minutes' where org_id = $1", [orgId]);
   await reconcileInFlightTickets(client as never, 30);
   const row = await pool.query<{ state: string }>("select state from org_transactions where org_id = $1", [orgId]);
   assert.equal(row.rows[0]!.state, "failed", "no ticket existed -> reservation released");

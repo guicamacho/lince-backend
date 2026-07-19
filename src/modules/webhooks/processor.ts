@@ -87,10 +87,19 @@ const resendHandler: WebhookHandler = async (client, row) => {
   }
 };
 
+/** Didit events are verified + stored but intentionally UNPROCESSED until the vendor
+ *  integration lands (KYB state advances by ops relay today, not webhook). The greppable
+ *  warn keeps them from being silently swallowed if Didit goes live before the handler
+ *  (review 2026-07-20 L4). */
+const diditHandler: WebhookHandler = async (_client, row) => {
+  console.warn("didit.event_stored_unprocessed", JSON.stringify({ eventId: row.id, eventType: row.event_type }));
+};
+
 const DEFAULT_HANDLERS: Record<string, WebhookHandler> = {
   clerk: clerkHandler,
   avenia: aveniaHandler,
   resend: resendHandler,
+  didit: diditHandler,
 };
 
 /**

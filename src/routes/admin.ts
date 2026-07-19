@@ -257,6 +257,14 @@ export function registerAdminRoutes(app: Express): void {
       res.status(400).json({ error: "invalid_source" });
       return;
     }
+    // Security review 2026-07-20 M1: once four-eyes exists, a single admin must not be able
+    // to block an org unilaterally — block goes through the approvals queue ONLY. Suspend and
+    // reinstate stay direct (reversible / time-critical). With maker-checker off (single-
+    // operator reality today) the direct block remains available.
+    if (action === "block" && env.makerCheckerEnabled) {
+      res.status(403).json({ error: "use_approvals" });
+      return;
+    }
     const orgId = String(req.params.id);
     const adminId = actingAdminId(res);
     await setOrgAccess({
